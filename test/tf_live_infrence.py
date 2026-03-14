@@ -3,6 +3,7 @@ from pathlib import Path
 
 import cv2
 import argparse
+import json
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -51,7 +52,36 @@ def main():
     use_tpu = args.tpu
     tolerance = args.confidence
 
-    cap = cv2.VideoCapture(video_source)
+    pipeline = (
+        'libcamerasrc camera-name="/base/axi/pcie@1000120000/rp1/i2c@80000/imx219@10" ! video/x-raw,width=640,height=480,format=NV12 ! videoconvert ! appsink'  
+    )
+
+    #cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+    cap = cv2.VideoCapture('rtsp://root:12345@10.42.0.2/stream=0')
+
+    gst_out = (
+    f'appsrc ! '
+    f'videoconvert ! '
+    f'video/x-raw,format=I420,width=640,height=480,framerate=30/1 ! '
+    f'x264enc ! '
+    f'rtph264pay config-interval=1 pt=96 ! '
+    #f'jpegenc quality=85 ! '
+    #f'rtpjpegpay ! '
+    #f'udpsink host=100.80.163.116 port=5600'
+    f'udpsink host=100.73.135.84 port=5600'
+)
+
+    writer = cv2.VideoWriter(
+        gst_out,
+        cv2.CAP_GSTREAMER,
+        0,
+        30,
+        (640, 480),
+        True
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError("Failed to open GStreamer VideoWriter")
 
     if not cap.isOpened():
         print("Error: Could not open video stream.")
@@ -80,16 +110,15 @@ def main():
 
         out = m.detect(frame, nms=use_nms, tol=tolerance)
 
+        print(json.dumps(out, indent=2))
+
         for detection in out:
             bbox = detection["bbox"]
             x_min, y_min = int(bbox[0][0]), int(bbox[0][1])
             x_max, y_max = int(bbox[1][0]), int(bbox[1][1])
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
 
-        cv2.imshow("Frame", frame)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        writer.write(frame)
 
 
 if __name__ == "__main__":

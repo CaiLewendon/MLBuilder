@@ -14,16 +14,9 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 
 dependencies = [
-    "ultralytics>=8.3.207",
     "tensorflow>=2.0.0,<=2.19.0",
     "tf_keras<=2.19.0",
-    "sng4onnx>=1.0.1",
-    "onnx_graphsurgeon>=0.3.26",
     "ai-edge-litert>=1.2.0; sys_platform == 'linux'",  # Linux only
-    "onnx>=1.12.0",
-    "onnx2tf>=1.26.3",
-    "onnxslim>=0.1.67",
-    "onnxruntime",
     "numpy",
     "opencv-python",
 ]

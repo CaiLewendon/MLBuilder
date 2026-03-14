@@ -1,0 +1,8 @@
+Looking in indexes: https://pypi.org/simple, https://www.piwheels.org/simple
+Requirement already satisfied: ai-edge-litert in /home/pi/venv/lib/python3.12/site-packages (2.1.2)
+Requirement already satisfied: backports.strenum in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (1.2.8)
+Requirement already satisfied: flatbuffers in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (20181003210633)
+Requirement already satisfied: numpy>=1.23.2 in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (2.1.3)
+Requirement already satisfied: tqdm in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (4.67.3)
+Requirement already satisfied: typing-extensions in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (4.15.0)
+Requirement already satisfied: protobuf in /home/pi/venv/lib/python3.12/site-packages (from ai-edge-litert) (5.29.6)
