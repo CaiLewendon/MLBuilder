@@ -1,45 +1,50 @@
-# CODEX Session Log: Edge TPU + Live Inference Bring-Up
+# CODEX Session Log: Edge TPU + Relay + Runtime Tuning
 
 Date: 2026-05-02
 Project: `MLBuilder`
-Scope: Laptop local validation, Raspberry Pi + Coral Edge TPU deployment, RTSP ingest and UDP relay output.
+Primary runtime: Raspberry Pi + Coral Edge TPU
+Viewer path: Relay -> laptop GStreamer receiver
 
-## Objective
-- Run target detection on live camera/RTSP using custom dataset artifacts.
-- Deploy Edge TPU model to Pi and validate detections + relay stream to laptop.
+## Executive Summary
+- Core TPU inference path is operational.
+- Relay/viewer path is operational when relay service is up.
+- A critical decode bug was fixed in production (`(5,8400)` raw-head routing).
+- Current blocker is quality, not bring-up:
+  - false positives on foreground objects
+  - weak recall on far/background target instances
+  - aggressive filtering can suppress all detections if tuned too hard
 
-## Artifacts Identified
-- Dataset:
-  - `project-1-at-2026-04-12-21-16-9fb8c3ae/data.yaml`
-  - `project-1-at-2026-04-12-21-16-9fb8c3ae/classes.txt` (`Target`)
-- Working CPU-side TFLite:
-  - `model_saved_model/model_int8.tflite`
-- Edge TPU model for deployment:
-  - `export/model_full_integer_quant_edgetpu.tflite`
-- Label file used in deployment:
-  - `target_detector_labels.txt` (contains `Target`)
+## Chronological Milestones
+1. Located live scripts and model artifacts.
+2. Verified dataset split and labels:
+   - total 492 images
+   - train 393, val 99
+3. Identified deployment models:
+   - CPU-side test model: `model_saved_model/model_int8.tflite`
+   - Edge TPU model: `export/model_full_integer_quant_edgetpu.tflite`
+4. Confirmed `_edgetpu.tflite` cannot run on non-TPU interpreter (expected `edgetpu-custom-op` failure on CPU).
+5. Confirmed Pi allocation path:
+   - TPU active `True`
+   - input dtype `int8`
+   - input shape `[1,640,640,3]`
+6. Isolated decode bug:
+   - probe showed output shape `(1,5,8400)` -> raw head format
+   - legacy `[N,6]` condition was too broad and consumed raw-head output
+7. Applied minimal production fix:
+   - changed `[N,6]` branch gate to require `N >> cols` shape
+8. Re-ran on Pi:
+   - detections resumed (`detections=1..3` observed)
+9. Relay/video mismatch incident:
+   - temporary "no video" was relay-down state, not inference failure
+10. Added runtime enhancements in script iterations:
+   - post-filtering (min conf, area ratio, edge-touch suppression)
+   - optional center-crop pass
+   - optional second crop and CLAHE suggestions
+11. Current quality issue:
+   - model can still mislabel near foreground object while missing far background target
 
-## Key Findings
-1. `scp -i <model.tflite> ...` failed because `-i` is SSH key flag, not source-file flag.
-2. `_edgetpu.tflite` cannot run on CPU-only interpreter (`edgetpu-custom-op` unresolved), expected behavior.
-3. `export/project1_prod_int8.tflite` behaved inconsistently in this stack (no useful detections in app path).
-4. Confirmed `model_saved_model/model_int8.tflite` produced detections locally.
-5. Pi runtime showed TPU delegate active:
-   - `[ALLOCATE] TPU active: True`
-   - input `int8`, shape `[1,640,640,3]`
-6. Major decode bug on Pi path:
-   - Model output probe showed `out shape: (5, 8400)` (raw head format), not `[N,6]`.
-   - Existing code routed this through `[N,6]` branch due to broad condition, causing zero detections.
-7. Correcting branch gate fixed detections on Pi immediately.
-
-## Root Cause
-`detect()` postprocessed branch condition was too permissive:
-- Bad condition:
-  - `if out.ndim == 2 and out.shape[1] >= 6:`
-- For `out.shape == (5,8400)`, this incorrectly matched and treated raw-head output as `[N,6]`, suppressing all detections.
-
-## Production Fix That Worked
-Change only the `[N,6]` gate condition in production `TFLiteModel.detect()`:
+## Critical Production Fix (Already Known Good)
+- In production `MLBuilder/model/tflite/tflitemodel.py` detect logic:
 
 From:
 - `if out.ndim == 2 and out.shape[1] >= 6:`
@@ -47,25 +52,41 @@ From:
 To:
 - `if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:`
 
-Result after fix:
-- Pi showed continuous non-zero detections (`detections=1..3`, periodic `infer_frames=... dets=1`).
+Why:
+- prevents `(5,8400)` raw head tensors from being treated as `[N,6]` postprocessed tensors.
 
-## Verified Commands
-- Pi inference (working after fix):
-  - `python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o -c 0.01`
-- Output-shape probe that proved raw-head format:
-  - output shape `(1,5,8400)`, dequantized max ~`1.007`
+## Verified Good Command Baselines
+- Pi inference command baseline:
+  - `python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o`
+- Laptop receiver baseline (when relay outputs H264 on 5000):
+  - `gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false`
 
-## Streaming/Relay Notes
-- Inference path and stream-view path are separate concerns.
-- A temporary “no video” event was relay-side (relay not up), not inference-side.
-- Once relay path was valid, detections were still confirmed in Pi logs.
+## Current Observations (Most Recent)
+- With decoding fix, detections appear reliably in logs.
+- With stricter filtering/cropping, false positives can reduce, but recall can drop to zero.
+- Scene has strong clutter + lighting gradients; small far target is near detection limit.
 
-## What Not To Change
-- Do not broadly rewrite production decode logic unless needed.
-- Keep production code minimal-change for this fix (single branch gate correction).
+## Tactical Runtime Levers (No Retraining)
+- Lower model-stage threshold (`--confidence`) to keep candidate boxes.
+- Use moderate post-filter threshold (`--min-conf`) instead of hard cut.
+- Multi-crop ROI strategy (center + upper-middle crop) improves far-target recall.
+- CLAHE can help contrast but may also amplify noise; must be tuned empirically.
 
-## Final Status
-- Edge TPU inference path: WORKING.
-- Detection outputs: WORKING on Pi.
-- Remaining ops are deployment hygiene (relay uptime/caps validation, optional confidence tuning).
+## Known Pitfalls
+- Over-filtering can create "no detections" despite working model.
+- Aspect ratio / geometry filters can remove true positives if target perspective varies.
+- Relay diagnostics can mask inference diagnostics; always confirm both independently.
+
+## Hard Separation of Concerns
+- Inference correctness:
+  - confirmed by Pi log detections and raw output probes.
+- Stream transport correctness:
+  - confirmed separately by relay health + matching receiver caps/codec.
+
+## Remaining Work
+- Stabilize false-positive/recall tradeoff without retraining.
+- Produce one locked "operational profile" (args set) for reliable demo behavior.
+- Add a deterministic debug mode that prints:
+  - raw candidate count
+  - filtered count
+  - crop-pass contribution count

@@ -1,29 +1,48 @@
 # Kanban
 
 ## Done
-- Identify candidate live inference scripts and model artifacts.
-- Verify dataset split counts and custom label set presence.
-- Identify Coral-compatible deployment artifact:
-  - `export/model_full_integer_quant_edgetpu.tflite`
-- Validate Pi TPU allocation (`TPU active: True`).
-- Add runtime instrumentation to confirm inference loop activity.
-- Probe raw model output on Pi and confirm shape `(1,5,8400)`.
-- Isolate decode-branch bug for raw-head output.
-- Apply minimal production-safe fix to `[N,6]` branch condition.
-- Re-run on Pi and confirm non-zero detections.
-- Confirm “video not showing” incident due to relay state mismatch (relay down), not inference.
+- Established Pi + Coral inference bring-up end-to-end.
+- Confirmed correct model artifact for TPU deployment.
+- Diagnosed and fixed raw-head decode routing bug (`(5,8400)` vs `[N,6]`).
+- Verified relay outage as independent failure source from inference.
+- Added first-pass runtime quality mitigations:
+  - geometric post-filtering
+  - optional crop-pass strategy
+- Verified detections can be produced continuously after decode fix.
 
 ## In Progress
-- None.
+- Runtime tuning to reduce false positives while preserving far-target recall.
 
-## Next
-- Lock relay/service startup ordering so relay is always up before inference test.
-- Capture and store one known-good end-to-end test transcript (Pi logs + laptop viewer).
-- Optionally tune confidence threshold (`0.01` -> operational value) based on false positive tolerance.
-- Optional: add a one-line runtime print of selected decode path for future debugging.
+## Next (High Priority)
+1. Add deterministic debug counters in production script:
+   - `raw_count`
+   - `filtered_count`
+   - `crop1_added`
+   - `crop2_added` (if enabled)
+2. Lock one "permissive baseline" config that always detects something in current scene.
+3. Incrementally increase strictness to remove false positives:
+   - raise `min_conf` gradually
+   - apply/adjust area-edge gates
+   - test optional aspect-ratio gate after baseline is stable
+4. Validate far-target recall with upper-biased crop center:
+   - center crop and second upper crop
+5. Save one known-good argument profile in `lteboardroutingcommand.txt`.
+
+## Next (Medium Priority)
+1. Add temporal confirmation gate (2-of-3 frame persistence) as optional argument.
+2. Add CLI flags for all filter thresholds and crop centers/ratios.
+3. Add a "debug overlay mode" to color boxes by source pass (full/crop1/crop2).
 
 ## Backlog
-- Add unit/regression test for `detect()` branch selection:
-  - `[N,6]` path should require `N >> cols` shape.
-  - `(5,8400)` must route to raw-head path.
-- Add deployment checklist doc for model/label/relay/receiver caps alignment.
+1. Retraining path for durable accuracy improvement:
+   - more far-distance positives
+   - hard-negative clutter examples
+2. Add regression tests for decoder branch selection in `TFLiteModel.detect()`.
+3. Add deployment health checks:
+   - relay alive check
+   - receiver caps consistency check
+
+## Blockers / Risks
+- Single-class model in cluttered scene has intrinsic ambiguity at long distance.
+- Over-filtering currently causes all detections to disappear in some configs.
+- Lighting and perspective variation likely exceed model robustness without retraining.

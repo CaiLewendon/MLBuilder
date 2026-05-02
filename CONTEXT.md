@@ -1,45 +1,88 @@
-# Deployment Context (Current Ground Truth)
+# Deployment Context (Deep State Snapshot)
 
-## Environment
-- Laptop dev repo: `~/Documents/aerospace2025-26/MLBuilder`
-- Production runtime: Raspberry Pi + Coral Edge TPU
-- Inference script in production: `tf_live_inferenceV2.py` (on Pi)
+## Operating Topology
+- Source camera stream:
+  - RTSP `rtsp://10.42.0.1:8554/front_high`
+- Pi:
+  - consumes RTSP, runs inference with Coral TPU
+  - emits processed stream to downstream relay path
+- Relay:
+  - receives Pi output
+  - forwards to laptop
+- Laptop:
+  - receives relay output via `gst-launch-1.0`
 
-## Model + Labels
-- Edge TPU deployment model:
-  - `~/model_full_integer_quant_edgetpu.tflite` (on Pi)
+## Runtime Environments
+- Repo workspace (laptop dev): `~/Documents/aerospace2025-26/MLBuilder`
+- Production runtime (Pi): `~/MLBuilder`
+- Production inference script filename: `tf_live_inferenceV2.py` (Pi-local; not tracked in repo history shown here)
+
+## Active Model/Label Artifacts
+- Edge TPU model used on Pi:
+  - `~/model_full_integer_quant_edgetpu.tflite`
 - Labels:
-  - `../target_detector_labels.txt` from script directory
+  - `../target_detector_labels.txt` (from script working directory)
+- Class label expected:
+  - `Target`
 
-## Known Good Run Command (Pi)
+## Proven Working Baselines
+### Pi inference launch
 ```bash
-python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o -c 0.01
+python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o
 ```
 
-## Confirmed Allocation Output
-- TPU active: `True`
-- Input dtype: `int8`
-- Input shape: `[1, 640, 640, 3]`
+### Laptop receive (when relay is up and sending H264 on 5000)
+```bash
+gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
 
-## Critical Decode Fact
-- Raw output format from deployed model:
-  - `out shape: (5, 8400)` (raw head)
-- It is **not** `[N,6]` postprocessed output for this deployed artifact.
+## Critical Model Output Fact
+- Pi raw inference output probe:
+  - output tensor shape: `(1, 5, 8400)`
+  - dequantized output max ~`1.007`
+- Interpretation:
+  - raw-head detection format, not `[N,6]` postprocessed format.
 
-## Critical Code Fix (Production)
-- In `TFLiteModel.detect()`, changed `[N,6]` branch gate from:
-  - `if out.ndim == 2 and out.shape[1] >= 6:`
-- to:
-  - `if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:`
+## Critical Production Code Fix (Must Persist)
+- In `TFLiteModel.detect()`:
+  - old: `if out.ndim == 2 and out.shape[1] >= 6:`
+  - required: `if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:`
+- Rationale:
+  - ensures `(5,8400)` goes to raw-head decode path.
 
-This ensures `(5,8400)` takes raw-head/NMS path instead of incorrect postprocessed path.
+## Current Behavior
+- Inference path:
+  - functional
+  - prints detections when filters are permissive enough
+- Quality:
+  - can mislabel foreground clutter as target
+  - can miss background/far target
 
-## Symptoms Before Fix
-- Inference loop advanced (`infer_frames=...`) but `dets=0` forever.
+## Current Script Feature Set (as iterated in session)
+- optional post-filtering:
+  - min confidence
+  - max area ratio
+  - edge-touching suppression
+- optional crop passes:
+  - center crop pass
+  - optional second crop guidance discussed
+- optional contrast preprocessing (CLAHE) discussed for low-contrast far target recall
 
-## Symptoms After Fix
-- Non-zero detections reported continuously in production logs.
+## Known Failure Modes
+1. Relay down:
+   - no laptop video despite valid inference.
+2. Over-filtering:
+   - `raw > 0` but `filtered = 0`.
+3. Under-filtering:
+   - higher false positives in clutter.
 
-## Relay/Viewing Context
-- One “no display” episode was due to relay not running, not model inference failure.
-- Keep inference logs and relay pipeline debugging separate during triage.
+## Resume Checklist
+1. Verify relay up.
+2. Verify Pi TPU allocation lines show active `True`.
+3. Run with debug counts:
+   - raw candidate count
+   - filtered count
+4. Tune only one axis at a time:
+   - confidence thresholds
+   - crop geometry
+   - filter thresholds

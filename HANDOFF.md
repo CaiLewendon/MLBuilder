@@ -1,0 +1,104 @@
+# Session Handoff Runbook (Detailed)
+
+Date: 2026-05-02
+Owner context: live Pi + Coral deployment with relay to laptop viewer.
+
+## 1) What Is Working Right Now
+- TPU inference allocation on Pi is working:
+  - `[ALLOCATE] TPU active: True`
+  - input shape `[1,640,640,3]`
+- Decode-path fix is validated:
+  - model output `(1,5,8400)` now routes to raw-head parser.
+- Relay/viewer is known to work when relay is up and output caps match receiver.
+
+## 2) What Is Not Stable Yet
+- Quality tuning:
+  - foreground clutter may be mislabeled as `Target`.
+  - far/background true target can be missed.
+- Some script configurations over-filter and return no detections.
+
+## 3) Critical Invariant (Do Not Regress)
+In production `TFLiteModel.detect()`:
+- Keep `[N,6]` branch gate strict:
+  - `if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:`
+
+If this reverts, Pi may return zero detections again.
+
+## 4) Commands You Need
+
+### Pi inference baseline
+```bash
+python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o
+```
+
+### Laptop receiver baseline (relay must be up)
+```bash
+gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,clock-rate=90000,encoding-name=H264,payload=96" ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+```
+
+## 5) Fast Triage Decision Tree
+
+### Case A: No video on laptop
+1. Confirm relay process is running.
+2. Confirm relay output codec/port still match receiver command.
+3. Confirm Pi is actually writing stream to relay input.
+
+### Case B: Video appears, no boxes
+1. Check Pi logs for inference heartbeat (`infer_frames=...`).
+2. If no heartbeat: inference loop stalled.
+3. If heartbeat present:
+   - print `raw_count` and `filtered_count`.
+   - if `raw_count > 0` and `filtered_count == 0`: filters too strict.
+   - if `raw_count == 0`: detection stage or crop strategy too strict.
+
+### Case C: Boxes appear but wrong object selected
+1. Lower reliance on single-frame confidence.
+2. Add/enable temporal confirmation.
+3. Tune geometry/aspect/area filters gradually.
+4. Bias crop strategy toward expected target region.
+
+## 6) Recommended Next Experiment Plan
+Run 5-minute fixed-scene tests and log counts:
+1. Permissive baseline:
+   - low model confidence threshold
+   - minimal post-filter
+2. Add filter thresholds one at a time:
+   - min confidence
+   - max area ratio
+   - edge-touch suppression
+3. Add crop pass:
+   - center crop
+4. Add upper crop:
+   - target likely appears in upper middle background
+5. Compare:
+   - true target hit rate
+   - false positive rate
+   - time-to-first-detection
+
+## 7) Suggested Debug Metrics to Print Each N Frames
+- `raw_count`
+- `filtered_count`
+- `crop1_count`
+- `crop2_count`
+- optional median confidence of kept detections
+
+These make tuning objective instead of visual-only.
+
+## 8) File/Artifact Notes
+- Current repo has documentation updates:
+  - `CODEX.md`
+  - `CONTEXT.md`
+  - `KANBAN.md`
+  - `HANDOFF.md`
+- Production script filename in use:
+  - `tf_live_inferenceV2.py` on Pi
+- Repo script may differ:
+  - `test/tf_live_infrence.py` exists for local experimentation.
+
+## 9) Practical Stop Conditions
+- Acceptable interim operating point:
+  - consistent detection of true target in background in target scenario
+  - false positives below operator tolerance
+  - no stream interruptions due to relay mismatch
+
+If unreachable with runtime tuning only, move to retraining with more far-target positives and clutter negatives.

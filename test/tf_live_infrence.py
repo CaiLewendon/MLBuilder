@@ -8,6 +8,25 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
+def center_crop(frame, ratio: float):
+    h, w = frame.shape[:2]
+    crop_w = max(1, int(w * ratio))
+    crop_h = max(1, int(h * ratio))
+    x0 = (w - crop_w) // 2
+    y0 = (h - crop_h) // 2
+    return frame[y0 : y0 + crop_h, x0 : x0 + crop_w], x0, y0
+
+
+def remap_detections(detections, x_off: int, y_off: int):
+    remapped = []
+    for detection in detections:
+        (x1, y1), (x2, y2) = detection["bbox"]
+        d = dict(detection)
+        d["bbox"] = ((int(x1) + x_off, int(y1) + y_off), (int(x2) + x_off, int(y2) + y_off))
+        remapped.append(d)
+    return remapped
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="tflive", description="TF Live Infrence Model Test"
@@ -40,6 +59,17 @@ def main():
         type=float,
         default=0.25,
     )
+    parser.add_argument(
+        "--center-crop-pass",
+        action="store_true",
+        help="Run a second detection pass on a center crop and merge detections",
+    )
+    parser.add_argument(
+        "--center-crop-ratio",
+        type=float,
+        default=0.5,
+        help="Center crop size ratio for second pass (0<ratio<=1.0)",
+    )
 
     args = parser.parse_args()
     try:
@@ -50,6 +80,11 @@ def main():
     use_nms = args.nms
     use_tpu = args.tpu
     tolerance = args.confidence
+    crop_pass = args.center_crop_pass
+    crop_ratio = args.center_crop_ratio
+
+    if crop_pass and not (0.0 < crop_ratio <= 1.0):
+        parser.error("--center-crop-ratio must be > 0.0 and <= 1.0")
 
     cap = cv2.VideoCapture(video_source)
 
@@ -79,6 +114,10 @@ def main():
         frame_skip = 0
 
         out = m.detect(frame, nms=use_nms, tol=tolerance)
+        if crop_pass:
+            cropped, x_off, y_off = center_crop(frame, crop_ratio)
+            crop_out = m.detect(cropped, nms=use_nms, tol=tolerance)
+            out.extend(remap_detections(crop_out, x_off, y_off))
 
         for detection in out:
             bbox = detection["bbox"]
