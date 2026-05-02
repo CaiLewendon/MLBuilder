@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 FPS = 10
-WIDTH = 640
-HEIGHT = 360
+WIDTH = 1920
+HEIGHT = 1080
 
 COCO80_NAMES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
@@ -65,6 +65,38 @@ def resolve_label(class_id: int, labels: list) -> str:
         return labels[class_id]
     return f"class_{class_id}"
 
+# add near imports/helpers
+def filter_detections(detections, frame, min_conf=0.15, max_area_ratio=0.35, edge_margin_ratio=0.01):
+    h, w = frame.shape[:2]
+    frame_area = float(w * h)
+    mx = int(w * edge_margin_ratio)
+    my = int(h * edge_margin_ratio)
+
+    kept = []
+    for d in detections:
+        conf = float(d.get("confidence", 0.0))
+        if conf < min_conf:
+            continue
+
+        (x1, y1), (x2, y2) = d["bbox"]
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+
+        area_ratio = (bw * bh) / frame_area
+        touches_edge = (x1 <= mx) or (y1 <= my) or (x2 >= (w - 1 - mx)) or (y2 >= (h - 1 - my))
+
+        # kill giant box false positives
+        if area_ratio > max_area_ratio:
+            continue
+
+        # extra guard: edge-touching large boxes are usually junk
+        if touches_edge and area_ratio > 0.15:
+            continue
+
+        kept.append(d)
+
+    return kept
 
 def main():
     parser = argparse.ArgumentParser(prog="tflive", description="TF Live Inference Model Test")
@@ -137,7 +169,8 @@ def main():
                     frame = latest_frame[0]
                 if frame is None:
                     continue
-                detections = m.detect(frame, nms=args.nms, tol=args.confidence)
+                raw = m.detect(frame, nms=args.nms, tol=args.confidence)
+                detections = filter_detections(raw, frame, min_conf=0.15, max_area_ratio=0.35, edge_margin_ratio=0.01)
                 count+=1
                 if count % 30 == 0:
                     print(f"infer_frames={count} dets={len(detections)}")
