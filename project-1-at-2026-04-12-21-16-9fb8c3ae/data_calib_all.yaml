@@ -1,0 +1,5 @@
+path: /home/caile/Documents/aerospace2025-26/MLBuilder/project-1-at-2026-04-12-21-16-9fb8c3ae
+train: train.txt
+val: all.txt
+names:
+  0: Target
