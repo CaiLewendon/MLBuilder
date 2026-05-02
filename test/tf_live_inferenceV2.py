@@ -33,7 +33,7 @@ pipeline3 = (
     "h264parse !"
     "avdec_h264 !"
     "videoconvert !"
-    "appsink drop=true max-buffers=1 sync=false"  # drop stale frames, don't block
+    "appsink drop=true max-buffers=1 sync=false"
 )
 
 pipeline4 = (
@@ -65,8 +65,17 @@ def resolve_label(class_id: int, labels: list) -> str:
         return labels[class_id]
     return f"class_{class_id}"
 
-# add near imports/helpers
-def filter_detections(detections, frame, min_conf=0.15, max_area_ratio=0.35, edge_margin_ratio=0.01):
+
+def apply_clahe_bgr(frame, clip_limit=2.0, grid_size=8):
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(grid_size, grid_size))
+    l2 = clahe.apply(l)
+    merged = cv2.merge((l2, a, b))
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+
+def filter_detections(detections, frame, min_conf=0.05, max_area_ratio=0.35, edge_margin_ratio=0.01):
     h, w = frame.shape[:2]
     frame_area = float(w * h)
     mx = int(w * edge_margin_ratio)
@@ -83,14 +92,16 @@ def filter_detections(detections, frame, min_conf=0.15, max_area_ratio=0.35, edg
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
 
+        # reject elongated/flat blobs (target should be roughly round)
+        aspect = bw / max(1.0, bh)
+        if aspect < 0.65 or aspect > 1.45:
+            continue
+
         area_ratio = (bw * bh) / frame_area
         touches_edge = (x1 <= mx) or (y1 <= my) or (x2 >= (w - 1 - mx)) or (y2 >= (h - 1 - my))
 
-        # kill giant box false positives
         if area_ratio > max_area_ratio:
             continue
-
-        # extra guard: edge-touching large boxes are usually junk
         if touches_edge and area_ratio > 0.15:
             continue
 
@@ -98,19 +109,83 @@ def filter_detections(detections, frame, min_conf=0.15, max_area_ratio=0.35, edg
 
     return kept
 
+
+def crop_at(frame, ratio: float, center_x: float, center_y: float):
+    h, w = frame.shape[:2]
+    cw = max(1, int(w * ratio))
+    ch = max(1, int(h * ratio))
+
+    cx = int(round(center_x * (w - 1)))
+    cy = int(round(center_y * (h - 1)))
+
+    x0 = cx - cw // 2
+    y0 = cy - ch // 2
+
+    x0 = max(0, min(x0, w - cw))
+    y0 = max(0, min(y0, h - ch))
+
+    return frame[y0:y0 + ch, x0:x0 + cw], x0, y0
+
+
+def remap_detections(detections, x_off: int, y_off: int):
+    out = []
+    for d in detections:
+        (x1, y1), (x2, y2) = d["bbox"]
+        c = dict(d)
+        c["bbox"] = ((int(x1) + x_off, int(y1) + y_off), (int(x2) + x_off, int(y2) + y_off))
+        out.append(c)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tflive", description="TF Live Inference Model Test")
     parser.add_argument("model", nargs="?", help="TFlite model to run", type=str)
     parser.add_argument("--nms", "-n", action="store_false")
     parser.add_argument("--tpu", "-t", action="store_true")
-    parser.add_argument("--confidence", "-c", type=float, default=0.25)
+    parser.add_argument("--confidence", "-c", type=float, default=0.01)
     parser.add_argument("--labels", "-l", type=str, default=None)
     parser.add_argument("--process", "-p", action="store_true", help="Enable inference processing")
     parser.add_argument("--overlay", "-o", action="store_true", help="Draw detection labels/boxes on output video")
+
+    # Filtering knobs
+    parser.add_argument("--min-conf", type=float, default=0.05, help="Post-filter minimum confidence")
+    parser.add_argument("--max-area-ratio", type=float, default=0.35, help="Reject boxes larger than this frame-area ratio")
+    parser.add_argument("--edge-margin-ratio", type=float, default=0.01, help="Edge margin ratio for edge-touch rejection")
+
+    # Crop pass knobs
+    parser.add_argument("--center-crop-pass", action="store_true", help="Run second inference pass on a crop")
+    parser.add_argument("--center-crop-ratio", type=float, default=0.5, help="Primary crop ratio (0<ratio<=1)")
+    parser.add_argument("--crop-center-x", type=float, default=0.5, help="Primary crop center x in [0,1]")
+    parser.add_argument("--crop-center-y", type=float, default=0.5, help="Primary crop center y in [0,1]")
+
+    parser.add_argument("--second-crop-pass", action="store_true", help="Run third inference pass on a second crop")
+    parser.add_argument("--second-crop-ratio", type=float, default=0.45, help="Second crop ratio (0<ratio<=1)")
+    parser.add_argument("--second-crop-center-x", type=float, default=0.55, help="Second crop center x in [0,1]")
+    parser.add_argument("--second-crop-center-y", type=float, default=0.35, help="Second crop center y in [0,1]")
+
+    # Contrast enhancement
+    parser.add_argument("--clahe", action="store_true", help="Enable CLAHE contrast enhancement before inference")
+    parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clip limit")
+    parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE grid size")
+
     args = parser.parse_args()
 
     if args.process and not args.model:
         parser.error("--process requires a model argument")
+
+    if not (0.0 < args.center_crop_ratio <= 1.0):
+        parser.error("--center-crop-ratio must be > 0 and <= 1")
+    if not (0.0 < args.second_crop_ratio <= 1.0):
+        parser.error("--second-crop-ratio must be > 0 and <= 1")
+
+    for n, v in (
+        ("--crop-center-x", args.crop_center_x),
+        ("--crop-center-y", args.crop_center_y),
+        ("--second-crop-center-x", args.second_crop_center_x),
+        ("--second-crop-center-y", args.second_crop_center_y),
+    ):
+        if not (0.0 <= v <= 1.0):
+            parser.error(f"{n} must be in [0,1]")
 
     cap = cv2.VideoCapture(pipeline3, cv2.CAP_GSTREAMER)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -123,9 +198,6 @@ def main():
         print("Error: Could not open video stream.")
         exit()
 
-    # -------------------------------------------------------------------------
-    # PROCESSING MODE: inference + optional detection overlay
-    # -------------------------------------------------------------------------
     if args.process:
         try:
             labels = load_labels(args.labels)
@@ -142,7 +214,7 @@ def main():
         frame_lock = threading.Lock()
         det_lock = threading.Lock()
         stop_event = threading.Event()
-        frame_event = threading.Event()  # signals inference thread that a new frame is ready
+        frame_event = threading.Event()
 
         def capture_thread():
             skip = 0
@@ -157,25 +229,63 @@ def main():
                 skip = 0
                 with frame_lock:
                     latest_frame[0] = frame
-                frame_event.set()  # wake inference thread
+                frame_event.set()
 
         def inference_thread():
             count = 0
             while not stop_event.is_set():
-                # block until a new frame arrives, timeout so we can check stop_event
                 frame_event.wait(timeout=0.1)
                 frame_event.clear()
+
                 with frame_lock:
                     frame = latest_frame[0]
                 if frame is None:
                     continue
-                raw = m.detect(frame, nms=args.nms, tol=args.confidence)
-                detections = filter_detections(raw, frame, min_conf=0.15, max_area_ratio=0.35, edge_margin_ratio=0.01)
-                count+=1
+
+                infer_frame = frame
+                if args.clahe:
+                    infer_frame = apply_clahe_bgr(
+                        infer_frame,
+                        clip_limit=args.clahe_clip_limit,
+                        grid_size=args.clahe_grid,
+                    )
+
+                raw = m.detect(infer_frame, nms=args.nms, tol=args.confidence)
+
+                if args.center_crop_pass:
+                    crop, x_off, y_off = crop_at(
+                        infer_frame,
+                        args.center_crop_ratio,
+                        args.crop_center_x,
+                        args.crop_center_y,
+                    )
+                    raw_crop = m.detect(crop, nms=args.nms, tol=args.confidence)
+                    raw.extend(remap_detections(raw_crop, x_off, y_off))
+
+                if args.second_crop_pass:
+                    crop2, x_off2, y_off2 = crop_at(
+                        infer_frame,
+                        args.second_crop_ratio,
+                        args.second_crop_center_x,
+                        args.second_crop_center_y,
+                    )
+                    raw_crop2 = m.detect(crop2, nms=args.nms, tol=args.confidence)
+                    raw.extend(remap_detections(raw_crop2, x_off2, y_off2))
+
+                detections = filter_detections(
+                    raw,
+                    frame,
+                    min_conf=args.min_conf,
+                    max_area_ratio=args.max_area_ratio,
+                    edge_margin_ratio=args.edge_margin_ratio,
+                )
+
+                count += 1
                 if count % 30 == 0:
                     print(f"infer_frames={count} dets={len(detections)}")
                 if detections:
                     print(f"detections={len(detections)} first={detections[0]}")
+
                 with det_lock:
                     latest_detections[0] = detections
 
@@ -214,8 +324,16 @@ def main():
                         text = f"{label} {confidence:.2f}"
                         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                         cv2.rectangle(frame, (x_min, y_min - th - 6), (x_min + tw, y_min), (0, 255, 0), -1)
-                        cv2.putText(frame, text, (x_min, y_min - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+                        cv2.putText(
+                            frame,
+                            text,
+                            (x_min, y_min - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 0, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
 
                 frame = cv2.resize(frame, (WIDTH, HEIGHT))
                 if not frame.flags["C_CONTIGUOUS"]:
@@ -223,7 +341,6 @@ def main():
 
                 writer.write(frame)
 
-                # pace the main loop to FPS, yield remaining time to OS
                 elapsed = time.monotonic() - loop_start
                 sleep_time = frame_interval - elapsed
                 if sleep_time > 0:
@@ -236,9 +353,6 @@ def main():
             cap.release()
             writer.release()
 
-    # -------------------------------------------------------------------------
-    # PASSTHROUGH MODE: just forward video, no inference
-    # -------------------------------------------------------------------------
     else:
         frame_interval = 1.0 / FPS
         try:
