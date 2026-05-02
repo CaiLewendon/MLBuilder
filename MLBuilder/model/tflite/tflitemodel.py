@@ -4,10 +4,16 @@ import cv2
 from MLBuilder.model.mlmodel import MLModel, system, allow, disallow
 
 try:
-    from ai_edge_litert.interpreter import Interpreter, load_delegate
+    from tflite_runtime.interpreter import Interpreter, load_delegate
+
     INTERPRETER_EXSITS = True
 except ImportError:
-    INTERPRETER_EXSITS = False
+    try:
+        from ai_edge_litert.interpreter import Interpreter, load_delegate
+
+        INTERPRETER_EXSITS = True
+    except ImportError:
+        INTERPRETER_EXSITS = False
 
 
 class TFLiteModel(MLModel):
@@ -17,6 +23,10 @@ class TFLiteModel(MLModel):
         self._started = False
         self._using_tpu = False
         self._delegate = None
+        self._input_quant_scale = 0.0
+        self._input_quant_zero_point = 0
+        self._output_quant_scale = 0.0
+        self._output_quant_zero_point = 0
 
     @allow("pt")
     @system("linux")
@@ -119,6 +129,11 @@ class TFLiteModel(MLModel):
         self._input_details = self._intepreter.get_input_details()
         self._output_detail = self._intepreter.get_output_details()
 
+        input_quant = self._input_details[0].get("quantization", (0.0, 0))
+        output_quant = self._output_detail[0].get("quantization", (0.0, 0))
+        self._input_quant_scale, self._input_quant_zero_point = input_quant
+        self._output_quant_scale, self._output_quant_zero_point = output_quant
+
         if self._input_details[0]["dtype"] in (np.float32, np.float16):
             self._normalize = True
 
@@ -129,6 +144,37 @@ class TFLiteModel(MLModel):
         print(f"[ALLOCATE] Input shape: {self._input_details[0]['shape']}")
         if last_error is not None:
             print(f"[ALLOCATE] TPU init error was: {last_error}")
+
+    def _map_box_back(
+        self,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        input_w: int,
+        input_h: int,
+        pad_left: int,
+        pad_top: int,
+        scale: float,
+        data_w: int,
+        data_h: int,
+    ) -> tuple[int, int, int, int]:
+        if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 2.0:
+            x1 *= input_w
+            x2 *= input_w
+            y1 *= input_h
+            y2 *= input_h
+
+        x1 = int((x1 - pad_left) / scale)
+        y1 = int((y1 - pad_top) / scale)
+        x2 = int((x2 - pad_left) / scale)
+        y2 = int((y2 - pad_top) / scale)
+
+        x1 = max(0, min(x1, data_w - 1))
+        y1 = max(0, min(y1, data_h - 1))
+        x2 = max(0, min(x2, data_w - 1))
+        y2 = max(0, min(y2, data_h - 1))
+        return x1, y1, x2, y2
 
     @system("linux")
     def detect(self, data: np.ndarray, nms=False, tol=0.25):
@@ -152,7 +198,6 @@ class TFLiteModel(MLModel):
 
         pad_h = input_h - new_h
         pad_w = input_w - new_w
-
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
         pad_top = pad_h // 2
@@ -168,118 +213,179 @@ class TFLiteModel(MLModel):
             value=(0, 0, 0),
         )
 
-        if self._normalize:
-            model_input = padded_image.astype(np.float32) / 255.0
+        input_dtype = self._input_details[0]["dtype"]
+        if input_dtype in (np.float32, np.float16):
+            model_input = (padded_image.astype(np.float32) / 255.0).astype(input_dtype)
         else:
-            model_input = padded_image.astype(self._input_details[0]["dtype"])
+            model_input = padded_image.astype(np.float32) / 255.0
+            if self._input_quant_scale > 0:
+                model_input = (
+                    model_input / self._input_quant_scale + self._input_quant_zero_point
+                )
+            info = np.iinfo(input_dtype)
+            model_input = np.clip(np.round(model_input), info.min, info.max).astype(
+                input_dtype
+            )
 
         model_input = np.expand_dims(model_input, axis=0)
 
-        self._intepreter.set_tensor(
-            self._input_details[0]["index"],
-            model_input,
-        )
+        self._intepreter.set_tensor(self._input_details[0]["index"], model_input)
         self._intepreter.invoke()
         raw_out = self._intepreter.get_tensor(self._output_detail[0]["index"])
 
-        if not nms:
-            detections = raw_out[0]
-            valid = detections[detections[:, 4] > tol]
-
-            output = []
-
-            for detection in valid:
-                x_min = int((detection[0] * input_w - pad_left) / scale)
-                y_min = int((detection[1] * input_h - pad_top) / scale)
-                x_max = int((detection[2] * input_w - pad_left) / scale)
-                y_max = int((detection[3] * input_h - pad_top) / scale)
-
-                confidence = detection[4]
-                class_id = detection[5]
-
-                output.append(
-                    {
-                        "id": int(class_id),
-                        "confidence": float(confidence),
-                        "bbox": ((x_min, y_min), (x_max, y_max)),
-                    }
-                )
-
-            return output
+        out_dtype = self._output_detail[0]["dtype"]
+        if out_dtype in (np.int8, np.uint8) and self._output_quant_scale > 0:
+            raw_out = (
+                raw_out.astype(np.float32) - self._output_quant_zero_point
+            ) * self._output_quant_scale
 
         out = raw_out[0]
 
-        if out.shape[0] > out.shape[1]:
-            predictions = out
-        else:
-            predictions = out.T
+        # Postprocessed format: [N,6], but layout can vary by export/runtime:
+        # [x1,y1,x2,y2,conf,cls] or [x1,y1,x2,y2,cls,conf]
+        # [cx,cy,w,h,conf,cls]   or [cx,cy,w,h,cls,conf]
+        if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:
+            layouts = [
+                ("xyxy", 4, 5),
+                ("xyxy", 5, 4),
+                ("xywh", 4, 5),
+                ("xywh", 5, 4),
+            ]
 
-        boxes = predictions[:, :4]
-        class_scores = predictions[:, 4:]
+            best_results = []
+            best_count = -1
 
-        class_ids = np.argmax(class_scores, axis=1)
-        confidences = np.max(class_scores, axis=1)
+            for box_fmt, conf_idx, cls_idx in layouts:
+                if conf_idx >= out.shape[1] or cls_idx >= out.shape[1]:
+                    continue
 
-        mask = confidences > tol
-        filtered_boxes = boxes[mask]
-        filtered_confidences = confidences[mask]
-        filtered_class_ids = class_ids[mask]
+                conf_col = out[:, conf_idx]
+                valid = out[conf_col > tol]
+                results = []
 
-        if len(filtered_boxes) == 0:
+                for det in valid:
+                    if box_fmt == "xyxy":
+                        x1f, y1f, x2f, y2f = (
+                            float(det[0]),
+                            float(det[1]),
+                            float(det[2]),
+                            float(det[3]),
+                        )
+                    else:
+                        cx, cy, bw, bh = (
+                            float(det[0]),
+                            float(det[1]),
+                            float(det[2]),
+                            float(det[3]),
+                        )
+                        x1f = cx - bw / 2.0
+                        y1f = cy - bh / 2.0
+                        x2f = cx + bw / 2.0
+                        y2f = cy + bh / 2.0
+
+                    x1, y1, x2, y2 = self._map_box_back(
+                        x1f,
+                        y1f,
+                        x2f,
+                        y2f,
+                        input_w,
+                        input_h,
+                        pad_left,
+                        pad_top,
+                        scale,
+                        data_w,
+                        data_h,
+                    )
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    class_id = int(det[cls_idx])
+                    confidence = float(det[conf_idx])
+
+                    results.append(
+                        {
+                            "id": class_id,
+                            "confidence": confidence,
+                            "bbox": ((x1, y1), (x2, y2)),
+                        }
+                    )
+
+                if len(results) > best_count:
+                    best_count = len(results)
+                    best_results = results
+
+            return best_results
+
+        # Raw head format: [5,8400] or [8400,5], needs runtime NMS
+        predictions = out if out.shape[0] > out.shape[1] else out.T
+        if predictions.ndim != 2 or predictions.shape[1] < 5:
             return []
 
-        x_center = filtered_boxes[:, 0]
-        y_center = filtered_boxes[:, 1]
-        w = filtered_boxes[:, 2]
-        h = filtered_boxes[:, 3]
+        boxes_xywh = predictions[:, :4].astype(np.float32)
+        class_scores = predictions[:, 4:]
 
-        x_min = x_center - w / 2
-        y_min = y_center - h / 2
-        x_max = x_center + w / 2
-        y_max = y_center + h / 2
+        if class_scores.shape[1] == 1:
+            class_ids = np.zeros(class_scores.shape[0], dtype=np.int32)
+            confidences = class_scores[:, 0]
+        else:
+            class_ids = np.argmax(class_scores, axis=1)
+            confidences = np.max(class_scores, axis=1)
 
-        xyxy_boxes = np.stack([x_min, y_min, x_max, y_max], axis=1)
+        mask = confidences > tol
+        boxes_xywh = boxes_xywh[mask]
+        confidences = confidences[mask]
+        class_ids = class_ids[mask]
+
+        if len(boxes_xywh) == 0:
+            return []
+
+        if boxes_xywh[:, :4].max() <= 2.0:
+            boxes_xywh[:, [0, 2]] *= input_w
+            boxes_xywh[:, [1, 3]] *= input_h
+
+        x = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2.0
+        y = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2.0
+        w = boxes_xywh[:, 2]
+        h = boxes_xywh[:, 3]
+        nms_boxes = np.stack([x, y, w, h], axis=1)
 
         indices = cv2.dnn.NMSBoxes(
-            xyxy_boxes.tolist(),
-            filtered_confidences.tolist(),
-            tol,
+            nms_boxes.tolist(),
+            confidences.tolist(),
+            float(tol),
             0.45,
         )
-
         if len(indices) == 0:
             return []
 
-        if isinstance(indices, np.ndarray):
-            indices = indices.flatten()
-        else:
-            indices = np.array(indices).flatten()
-
-        final_boxes = xyxy_boxes[indices]
-        final_confidences = filtered_confidences[indices]
-        final_class_ids = filtered_class_ids[indices]
-
-        output = []
-        for box, confidence, class_id in zip(
-            final_boxes, final_confidences, final_class_ids
-        ):
-            x_min_scaled = int((box[0] - pad_left) / scale)
-            y_min_scaled = int((box[1] - pad_top) / scale)
-            x_max_scaled = int((box[2] - pad_left) / scale)
-            y_max_scaled = int((box[3] - pad_top) / scale)
-
-            output.append(
+        indices = np.array(indices).flatten()
+        results = []
+        for i in indices:
+            bx, by, bw, bh = nms_boxes[i]
+            x1, y1, x2, y2 = self._map_box_back(
+                float(bx),
+                float(by),
+                float(bx + bw),
+                float(by + bh),
+                input_w,
+                input_h,
+                pad_left,
+                pad_top,
+                scale,
+                data_w,
+                data_h,
+            )
+            if x2 <= x1 or y2 <= y1:
+                continue
+            results.append(
                 {
-                    "id": int(class_id),
-                    "confidence": float(confidence),
-                    "bbox": (
-                        (x_min_scaled, y_min_scaled),
-                        (x_max_scaled, y_max_scaled),
-                    ),
+                    "id": int(class_ids[i]),
+                    "confidence": float(confidences[i]),
+                    "bbox": ((x1, y1), (x2, y2)),
                 }
             )
 
-        return output
+        return results
 
     def using_tpu(self) -> bool:
         return self._using_tpu

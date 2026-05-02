@@ -1,5 +1,9 @@
-tflite-runtime==2.11.1
-tensorflow>=2.0.0,<=2.19.0
-tf_keras<=2.19.0
-ai-edge-litert>=1.2.0
-numpy
+# tflite-runtime==2.13.1
+# tensorflow>=2.0.0,<=2.19.0
+# tf_keras<=2.19.0
+# ai-edge-litert>=1.2.0
+# numpy
+
+numpy<2
+pycoral~=2.0
+opencv-python
