@@ -1,0 +1,7 @@
+python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o
+
+-c 0.5 to change confidence level
+
+# cropping
+
+python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu -l ../target_detector_labels.txt -p -o --center-crop-pass --center-crop-ratio 0.5
