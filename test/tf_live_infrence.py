@@ -27,6 +27,19 @@ def remap_detections(detections, x_off: int, y_off: int):
     return remapped
 
 
+def load_labels(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Labels file not found: {path}")
+    labels = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    return [label for label in labels if label]
+
+
+def label_for_class_id(class_id: int, labels: list[str]) -> str:
+    if 0 <= class_id < len(labels):
+        return labels[class_id]
+    return f"class_{class_id}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="tflive", description="TF Live Infrence Model Test"
@@ -70,6 +83,17 @@ def main():
         default=0.5,
         help="Center crop size ratio for second pass (0<ratio<=1.0)",
     )
+    parser.add_argument(
+        "--log-detections",
+        action="store_true",
+        help="Print per-frame detection count and bbox coordinates to console",
+    )
+    parser.add_argument(
+        "--labels",
+        type=str,
+        default=str(ROOT / "target_detector_labels.txt"),
+        help="Path to labels file (default: target_detector_labels.txt)",
+    )
 
     args = parser.parse_args()
     try:
@@ -82,9 +106,17 @@ def main():
     tolerance = args.confidence
     crop_pass = args.center_crop_pass
     crop_ratio = args.center_crop_ratio
+    log_detections = args.log_detections
+    labels_path = Path(args.labels).expanduser().resolve()
 
     if crop_pass and not (0.0 < crop_ratio <= 1.0):
         parser.error("--center-crop-ratio must be > 0.0 and <= 1.0")
+
+    try:
+        labels = load_labels(labels_path)
+    except FileNotFoundError as e:
+        parser.error(str(e))
+    print(f"[INFO] Loaded {len(labels)} labels from {labels_path}")
 
     cap = cv2.VideoCapture(video_source)
 
@@ -100,6 +132,7 @@ def main():
     m = TFLiteModel(model_path)
     m.allocate(tpu=use_tpu)
 
+    frame_idx = 0
     while True:
         ret, frame = cap.read()
 
@@ -112,6 +145,7 @@ def main():
             cap = cv2.VideoCapture(video_source)
             continue
         frame_skip = 0
+        frame_idx += 1
 
         out = m.detect(frame, nms=use_nms, tol=tolerance)
         if crop_pass:
@@ -119,11 +153,61 @@ def main():
             crop_out = m.detect(cropped, nms=use_nms, tol=tolerance)
             out.extend(remap_detections(crop_out, x_off, y_off))
 
+        cv2.putText(
+            frame,
+            f"detections={len(out)} frame={frame_idx}",
+            (10, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
         for detection in out:
             bbox = detection["bbox"]
-            x_min, y_min = int(bbox[0][0]), int(bbox[0][1])
-            x_max, y_max = int(bbox[1][0]), int(bbox[1][1])
+            x_min, y_min = bbox[0]
+            x_max, y_max = bbox[1]
+            class_id = int(detection.get("id", -1))
+            class_name = label_for_class_id(class_id, labels)
+            confidence = float(detection.get("confidence", 0.0))
             cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+            cv2.putText(
+                frame,
+                f"{class_name} ({class_id}) conf={confidence:.2f}",
+                (x_min, max(20, y_min - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        if log_detections:
+            if not out:
+                print(f"[F{frame_idx:06d}] detections=0")
+            else:
+                print(f"[F{frame_idx:06d}] detections={len(out)}")
+                for i, detection in enumerate(out):
+                    (x1, y1), (x2, y2) = detection["bbox"]
+                    class_id = int(detection.get("id", -1))
+                    class_name = label_for_class_id(class_id, labels)
+                    print(
+                        f"  [{i}] label={class_name} id={class_id} "
+                        f"conf={float(detection.get('confidence', 0.0)):.3f} "
+                        f"bbox=(({int(x1)},{int(y1)}),({int(x2)},{int(y2)}))"
+                    )
+        if not out:
+            cv2.putText(
+                frame,
+                "NO DETECTIONS",
+                (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
 
         cv2.imshow("Frame", frame)
 

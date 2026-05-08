@@ -146,6 +146,8 @@ class TFLiteModel(MLModel):
 
         if not nms:
             detections = raw_out[0]
+            if detections.ndim != 2 or detections.shape[1] < 6:
+                return []
             valid = detections[detections[:, 4] > tol]
 
             output = []
@@ -170,14 +172,21 @@ class TFLiteModel(MLModel):
             return output
         else:
             out = raw_out[0]
+            if out.ndim != 2:
+                return []
 
             if out.shape[0] > out.shape[1]:
                 predictions = out
             else:
                 predictions = out.T
 
+            if predictions.shape[1] < 5:
+                return []
+
             boxes = predictions[:, :4]
             class_scores = predictions[:, 4:]
+            if class_scores.shape[1] == 0:
+                return []
 
             class_ids = np.argmax(class_scores, axis=1)
             confidences = np.max(class_scores, axis=1)
@@ -195,15 +204,26 @@ class TFLiteModel(MLModel):
             w = filtered_boxes[:, 2]
             h = filtered_boxes[:, 3]
 
+            # Some TFLite exports emit normalized xywh [0..1], others emit pixel-space xywh.
+            # Normalize handling here so downstream bbox remap is always in padded-input pixel space.
+            if np.max(np.abs(filtered_boxes)) <= 2.0:
+                x_center = x_center * input_w
+                y_center = y_center * input_h
+                w = w * input_w
+                h = h * input_h
+
             x_min = x_center - w / 2
             y_min = y_center - h / 2
             x_max = x_center + w / 2
             y_max = y_center + h / 2
 
             xyxy_boxes = np.stack([x_min, y_min, x_max, y_max], axis=1)
+            xywh_boxes = np.stack(
+                [x_min, y_min, np.maximum(0.0, w), np.maximum(0.0, h)], axis=1
+            )
 
             indices = cv2.dnn.NMSBoxes(
-                xyxy_boxes.tolist(),
+                xywh_boxes.tolist(),
                 filtered_confidences.tolist(),
                 tol,
                 0.45,
