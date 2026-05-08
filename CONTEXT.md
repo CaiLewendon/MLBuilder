@@ -86,3 +86,36 @@ gst-launch-1.0 -v udpsrc port=5000 caps="application/x-rtp,media=video,clock-rat
    - confidence thresholds
    - crop geometry
    - filter thresholds
+
+## 2026-05-07/08 Local Session Addendum (Important)
+- Primary local goal completed:
+  - stable live detection + gimbal-command simulation baseline in repo test scripts.
+- Root cause fixed for "detections exist but bbox looks wrong/off-screen":
+  - core parser bug in `MLBuilder/model/tflite/tflitemodel.py` NMS path.
+  - fixes applied:
+    - normalized-vs-pixel `xywh` handling corrected before remap
+    - `cv2.dnn.NMSBoxes` input corrected to `xywh` format (was previously passed as `xyxy`)
+- Result:
+  - valid bbox coordinates are now produced in the live overlay path.
+
+### Current best-performing local command (save this)
+```bash
+venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0
+```
+
+### Why this command is the preferred baseline
+- Uses default model:
+  - `export/project1_prod_saved_model/project1_prod_float16.tflite`
+- Uses center-crop pass by default (important for recall).
+- Uses tuned detection confidence default (`0.20`).
+- Uses label file by default:
+  - `target_detector_labels.txt`
+- Prints readable gimbal `COMMAND_LONG` intent without requiring active MAVLink link.
+
+### Companion live-debug command (non-gimbal)
+```bash
+venv/bin/python test/tf_live_infrence.py export/project1_prod_saved_model/project1_prod_float16.tflite --video 0 --center-crop-pass --center-crop-ratio 0.5 -c 0.20 --log-detections
+```
+
+### Next resumption target
+- Transition from print-only gimbal simulation to real MAVLink transmission during drone/sim testing, while preserving the same detection defaults and center-crop behavior.

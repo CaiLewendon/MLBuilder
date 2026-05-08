@@ -90,3 +90,28 @@ Why:
   - raw candidate count
   - filtered count
   - crop-pass contribution count
+
+## 2026-05-07/08 Addendum: Local Live + Gimbal Simulation Baseline
+
+### Key fixes completed
+1. Core parser fix in `MLBuilder/model/tflite/tflitemodel.py`:
+   - corrected NMS-path bbox decoding for models outputting raw-head style tensors
+   - corrected `cv2.dnn.NMSBoxes` input to `xywh`
+2. Label usage standardized in local live test script:
+   - defaults to `target_detector_labels.txt`
+3. Gimbal simulation script finalized and renamed:
+   - `test/tf_live_infrence_gimbal_simulation.py`
+
+### Known-good command to reuse
+```bash
+venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0
+```
+
+### Why this command is preferred
+- Best observed local performance in current session.
+- Center-crop pass active by default (critical to recall).
+- Confidence default set to `0.20`.
+- Same model family and label path proven during session.
+
+### Next technical milestone
+- Move from print-only gimbal command simulation to actual MAVLink transmission and verify real gimbal motion correctness (direction sign, clamp behavior, response smoothness).

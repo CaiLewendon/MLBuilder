@@ -102,3 +102,34 @@ These make tuning objective instead of visual-only.
   - no stream interruptions due to relay mismatch
 
 If unreachable with runtime tuning only, move to retraining with more far-target positives and clutter negatives.
+
+---
+
+## 10) 2026-05-07/08 Session Closeout (Local Live + Gimbal Sim)
+
+### What was fixed in this session
+1. Fixed core bbox parsing in `MLBuilder/model/tflite/tflitemodel.py`:
+   - corrected normalized/pixel `xywh` interpretation in NMS path
+   - corrected OpenCV NMS input format to `xywh`
+2. Updated live test script for visibility and repeatability:
+   - labels loaded from `target_detector_labels.txt`
+   - stable overlay/log behavior retained
+3. Added/renamed gimbal simulation script:
+   - `test/tf_live_infrence_gimbal_simulation.py`
+   - print-only MAVLink-style gimbal commands (`MAV_CMD_DO_MOUNT_CONTROL`)
+   - axis conventions printed in console
+
+### Best command right now (keep as baseline)
+```bash
+venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0
+```
+
+### Why this is the best current baseline
+- Uses center-crop pass by default.
+- Uses tuned confidence default of `0.20`.
+- Uses latest working float16 default model path in-script.
+- Uses label file by default.
+- Produces stable detections and readable gimbal command outputs without requiring a MAVLink endpoint.
+
+### Next session first task
+- Implement and validate real MAVLink transmission for gimbal control on drone/sim while preserving the current detection defaults (especially center-crop pass).
