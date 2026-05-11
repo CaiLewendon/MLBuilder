@@ -343,6 +343,10 @@ def main() -> int:
         )
 
     print("[INFO] Full-suite MAVLink parity validator")
+    print(
+        "[INFO] Safety: no drone flight movement commands are sent in any mode; "
+        "only optional bounded gimbal mount probes may be sent."
+    )
     print(f"[INFO] Connection string: {CONNECTION_STRING}")
     print(f"[INFO] Mode: {args.mode}")
     print(f"[INFO] Strictness: {args.strictness}")
