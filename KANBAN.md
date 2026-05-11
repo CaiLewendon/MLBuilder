@@ -18,20 +18,29 @@
   - print-only `MAV_CMD_DO_MOUNT_CONTROL` command output
   - axis conventions displayed in console
 - Set labels default to `target_detector_labels.txt` in live test path.
+- Added and iterated drone positioning simulation script:
+  - `test/tf_live_infrence_drone_simulation.py`
+  - yaw-only center alignment (horizontal axis)
+  - forward/back stand-off control with inner-band trim toward exact setpoint
+  - post-approach altitude placement phase (target to bottom-quarter frame goal)
+  - final active hold with disturbance rejection (`yaw + vx + vz`)
+  - clarified on-screen vectors (single yaw vector + single altitude-to-goal vector)
+  - confidence gating and control telemetry refinements
 
 ## In Progress
 - Drone test integration planning:
-  - move from print-only gimbal simulation to real MAVLink command transmission
-  - validate real gimbal direction/sign mapping on airframe/simulator
+  - map simulation control outputs (`yaw_rate`, `vx`, `vz`) to real MAVLink commands
+  - validate sign conventions and gain scaling on airframe/simulator
+  - preserve current simulation overlays/logs as debug parity harness
 
 ## Next (High Priority)
-1. Run real gimbal-on-vehicle/sim test using current detection baseline.
-2. Implement non-dry-run MAVLink send path in gimbal script behind a flag.
-3. Validate mount command behavior end-to-end:
-   - `MAV_CMD_DO_MOUNT_CONTROL`
-   - yaw/pitch sign conventions
-   - clamp ranges and response smoothness
-4. Keep center-crop pass enabled by default for gimbal tracking path.
+1. Run drone-motion simulation soak test with recorded video and live camera sources.
+2. Implement optional real-command path behind a flag for:
+   - yaw control
+   - forward/back distance control
+   - altitude hold correction
+3. Validate end-to-end sign conventions and units against simulator/airframe.
+4. Keep center-crop pass enabled by default for this positioning path.
 5. Save one locked command profile for field testing.
 
 ## Next (Medium Priority)
@@ -52,10 +61,14 @@
 - Single-class model in cluttered scene has intrinsic ambiguity at long distance.
 - Over-filtering currently causes all detections to disappear in some configs.
 - Lighting and perspective variation likely exceed model robustness without retraining.
-- Real gimbal mount parameters (autopilot side) may differ from simulation assumptions.
+- Real autopilot response/gain tuning may differ from simulation assumptions.
 
 ## Known-Good Commands (Current Session)
 1. Live detection baseline:
    - `venv/bin/python test/tf_live_infrence.py export/project1_prod_saved_model/project1_prod_float16.tflite --video 0 --center-crop-pass --center-crop-ratio 0.5 -c 0.20 --log-detections`
 2. Best gimbal simulation baseline:
    - `venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0`
+3. Drone positioning simulation baseline:
+   - `venv/bin/python test/tf_live_infrence_drone_simulation.py --video 0`
+4. Drone simulation (stronger visible auto-correction tuning):
+   - `venv/bin/python test/tf_live_infrence_drone_simulation.py --video 0 --sim-lidar-start-cm 400 --sim-lidar-approach-factor 3.0 --min-distance-correct-vx 0.12 --deadband 0.12`

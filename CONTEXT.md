@@ -119,3 +119,44 @@ venv/bin/python test/tf_live_infrence.py export/project1_prod_saved_model/projec
 
 ### Next resumption target
 - Transition from print-only gimbal simulation to real MAVLink transmission during drone/sim testing, while preserving the same detection defaults and center-crop behavior.
+
+## 2026-05-10/11 Local Session Addendum (Drone Positioning Simulation)
+- New simulation script added:
+  - `test/tf_live_infrence_drone_simulation.py`
+- Detection stack intentionally kept aligned with current baseline:
+  - default model: `export/project1_prod_saved_model/project1_prod_float16.tflite`
+  - center-crop pass enabled by default
+  - default labels path: `target_detector_labels.txt`
+  - highest-confidence target selection
+- Control strategy implemented (simulation-only, print intent only):
+  1. Yaw-to-center alignment (horizontal-only)
+  2. Forward/back distance control to stand-off setpoint
+  3. Post-approach altitude phase to place target at bottom-quarter frame goal
+  4. Final active hold (yaw + distance + altitude disturbance rejection)
+- Distance behavior:
+  - outer tolerance window preserved (`target ± tolerance`, default `225 ± 15 cm`)
+  - inner center-band trim added so controller still seeks exact setpoint while inside tolerance
+  - minimum correction velocity added for both forward and backward correction visibility
+- Altitude behavior:
+  - goal line and vector to altitude target are rendered in-frame
+  - altitude state transitions: `ALTITUDE_ADJUST` -> `FINAL_HOLD`
+  - active hold includes vertical drift rejection simulation
+- Overlay/log clarifications added:
+  - explicit `yaw_to_center`
+  - horizontal yaw movement vector only (`yaw_vec_px`)
+  - single altitude vector to desired altitude point (`alt_to_goal_vec_px`) + altitude goal line
+  - commands shown as `cmd[yaw_rate,vx,vz]`
+  - disturbance telemetry shown for `vx` and `vz`
+
+### Current best local command for continuation
+```bash
+venv/bin/python test/tf_live_infrence_drone_simulation.py --video 0
+```
+
+### Useful tuning command (stronger visible auto-correction)
+```bash
+venv/bin/python test/tf_live_infrence_drone_simulation.py --video 0 --sim-lidar-start-cm 400 --sim-lidar-approach-factor 3.0 --min-distance-correct-vx 0.12 --deadband 0.12
+```
+
+### Next resumption target
+- Map this simulation state machine and control gains to real MAVLink position/yaw commands behind a guarded flag while preserving current visual/telemetry debug surfaces.
