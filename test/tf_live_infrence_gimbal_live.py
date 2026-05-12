@@ -12,6 +12,13 @@ FPS = 10
 WIDTH = 1920
 HEIGHT = 1080
 
+GIMBAL_YAW_MIN_DEG = -90.0
+GIMBAL_YAW_MAX_DEG = 90.0
+GIMBAL_PITCH_MIN_DEG = -45.0
+GIMBAL_PITCH_MAX_DEG = 45.0
+MAV_CMD_DO_MOUNT_CONTROL = 205
+MAV_MOUNT_MODE_MAVLINK_TARGETING = 2
+
 COCO80_NAMES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
     "truck", "boat", "traffic light", "fire hydrant", "stop sign",
@@ -92,10 +99,9 @@ def filter_detections(detections, frame, min_conf=0.05, max_area_ratio=0.35, edg
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
 
-        # reject elongated/flat blobs (target should be roughly round)
-        # aspect = bw / max(1.0, bh)
-        # if aspect < 0.65 or aspect > 1.45:
-        #     continue
+        aspect = bw / max(1.0, bh)
+        if aspect < 0.65 or aspect > 1.45:
+            continue
 
         area_ratio = (bw * bh) / frame_area
         touches_edge = (x1 <= mx) or (y1 <= my) or (x2 >= (w - 1 - mx)) or (y2 >= (h - 1 - my))
@@ -137,6 +143,49 @@ def remap_detections(detections, x_off: int, y_off: int):
     return out
 
 
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def direction_label(err_x: float, err_y: float, deadband: float) -> str:
+    horizontal = "CENTERED"
+    vertical = "CENTERED"
+
+    if err_x > deadband:
+        horizontal = "RIGHT"
+    elif err_x < -deadband:
+        horizontal = "LEFT"
+
+    if err_y > deadband:
+        vertical = "DOWN"
+    elif err_y < -deadband:
+        vertical = "UP"
+
+    if horizontal == "CENTERED" and vertical == "CENTERED":
+        return "CENTERED"
+    if horizontal == "CENTERED":
+        return vertical
+    if vertical == "CENTERED":
+        return horizontal
+    return f"{horizontal}+{vertical}"
+
+
+def send_mount_control(master, pitch_deg: float, yaw_deg: float) -> None:
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_MOUNT_CONTROL,
+        0,
+        float(pitch_deg),
+        0.0,
+        float(yaw_deg),
+        0.0,
+        0.0,
+        0.0,
+        float(MAV_MOUNT_MODE_MAVLINK_TARGETING),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(prog="tflive", description="TF Live Inference Model Test")
     parser.add_argument("model", nargs="?", help="TFlite model to run", type=str)
@@ -147,12 +196,10 @@ def main():
     parser.add_argument("--process", "-p", action="store_true", help="Enable inference processing")
     parser.add_argument("--overlay", "-o", action="store_true", help="Draw detection labels/boxes on output video")
 
-    # Filtering knobs
     parser.add_argument("--min-conf", type=float, default=0.05, help="Post-filter minimum confidence")
     parser.add_argument("--max-area-ratio", type=float, default=0.35, help="Reject boxes larger than this frame-area ratio")
     parser.add_argument("--edge-margin-ratio", type=float, default=0.01, help="Edge margin ratio for edge-touch rejection")
 
-    # Crop pass knobs
     parser.add_argument("--center-crop-pass", action="store_true", help="Run second inference pass on a crop")
     parser.add_argument("--center-crop-ratio", type=float, default=0.5, help="Primary crop ratio (0<ratio<=1)")
     parser.add_argument("--crop-center-x", type=float, default=0.5, help="Primary crop center x in [0,1]")
@@ -163,10 +210,20 @@ def main():
     parser.add_argument("--second-crop-center-x", type=float, default=0.55, help="Second crop center x in [0,1]")
     parser.add_argument("--second-crop-center-y", type=float, default=0.35, help="Second crop center y in [0,1]")
 
-    # Contrast enhancement
     parser.add_argument("--clahe", action="store_true", help="Enable CLAHE contrast enhancement before inference")
     parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clip limit")
     parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE grid size")
+
+    parser.add_argument("--mavlink", type=str, default="tcp:10.42.0.1:5760",
+                        help="pymavlink connection string for the autopilot (default: tcp:10.42.0.1:5760)")
+    parser.add_argument("--no-mavlink", action="store_true",
+                        help="Do not open a MAVLink connection (bench debug only; gimbal will not move)")
+    parser.add_argument("--deadband", type=float, default=0.08,
+                        help="Normalized image-center deadband before updating gimbal angles")
+    parser.add_argument("--yaw-gain", type=float, default=12.0,
+                        help="Yaw gain (deg per frame at full-scale horizontal error)")
+    parser.add_argument("--pitch-gain", type=float, default=10.0,
+                        help="Pitch gain (deg per frame at full-scale vertical error)")
 
     args = parser.parse_args()
 
@@ -186,6 +243,9 @@ def main():
     ):
         if not (0.0 <= v <= 1.0):
             parser.error(f"{n} must be in [0,1]")
+
+    if args.deadband < 0.0 or args.deadband >= 1.0:
+        parser.error("--deadband must be >= 0.0 and < 1.0")
 
     cap = cv2.VideoCapture(pipeline3, cv2.CAP_GSTREAMER)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -208,6 +268,30 @@ def main():
         from MLBuilder.model.tflite.tflitemodel import TFLiteModel
         m = TFLiteModel(args.model)
         m.allocate(tpu=args.tpu)
+
+        master = None
+        if not args.no_mavlink:
+            try:
+                from pymavlink import mavutil
+                print(f"[MAVLINK] Connecting: {args.mavlink}")
+                master = mavutil.mavlink_connection(args.mavlink)
+                master.wait_heartbeat(timeout=15)
+                print(
+                    f"[MAVLINK] heartbeat sysid={master.target_system} "
+                    f"compid={master.target_component}"
+                )
+            except Exception as e:
+                print(f"[MAVLINK] WARNING: connection/heartbeat failed: {e}")
+                print("[MAVLINK] Continuing without gimbal transmission (video pipeline still active).")
+                master = None
+        else:
+            print("[MAVLINK] Disabled via --no-mavlink (no commands will be sent)")
+
+        print("[INFO] Axis assumptions:")
+        print("  image: +x=right, +y=down, center=(frame_w/2, frame_h/2)")
+        print("  gimbal yaw (param3): +right/clockwise, -left/counter-clockwise")
+        print("  gimbal pitch (param1): +up, -down")
+        print("  control: target right -> yaw+, target left -> yaw-, target down -> pitch-, target up -> pitch+")
 
         latest_frame = [None]
         latest_detections = [[]]
@@ -296,6 +380,10 @@ def main():
 
         frame_interval = 1.0 / FPS
 
+        current_yaw = 0.0
+        current_pitch = 0.0
+        gimbal_frame_idx = 0
+
         try:
             while not stop_event.is_set():
                 loop_start = time.monotonic()
@@ -310,6 +398,10 @@ def main():
 
                 with det_lock:
                     detections = latest_detections[0]
+
+                selected = None
+                if detections:
+                    selected = max(detections, key=lambda d: float(d.get("confidence", 0.0)))
 
                 if args.overlay:
                     for detection in detections:
@@ -335,6 +427,91 @@ def main():
                             cv2.LINE_AA,
                         )
 
+                frame_h, frame_w = frame.shape[:2]
+                fx = int(frame_w / 2.0)
+                fy = int(frame_h / 2.0)
+
+                gimbal_frame_idx += 1
+                if selected is not None:
+                    (x1, y1), (x2, y2) = selected["bbox"]
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    err_x = (cx - float(fx)) / max(1.0, float(fx))
+                    err_y = (cy - float(fy)) / max(1.0, float(fy))
+
+                    move_label = direction_label(err_x, err_y, args.deadband)
+                    if move_label != "CENTERED":
+                        current_yaw += args.yaw_gain * err_x
+                        current_pitch -= args.pitch_gain * err_y
+                        current_yaw = clamp(current_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+                        current_pitch = clamp(current_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+                        if master is not None:
+                            try:
+                                send_mount_control(master, current_pitch, current_yaw)
+                            except Exception as e:
+                                print(f"[MAVLINK] send_mount_control failed: {e}")
+
+                    confidence = float(selected.get("confidence", 0.0))
+                    print(
+                        (
+                            f"[F{gimbal_frame_idx:06d}] target_bbox=(({int(x1)},{int(y1)}),({int(x2)},{int(y2)})) "
+                            f"center=({int(round(cx))},{int(round(cy))}) "
+                            f"err=({err_x:+.3f},{err_y:+.3f}) conf={confidence:.3f} dir={move_label} "
+                            f"yaw={current_yaw:.2f} pitch={current_pitch:.2f} "
+                            f"CMD_LONG cmd={MAV_CMD_DO_MOUNT_CONTROL} "
+                            f"param1={current_pitch:.2f} param2=0.00 param3={current_yaw:.2f} "
+                            f"param4=0.00 param5=0.00 param6=0.00 "
+                            f"param7={MAV_MOUNT_MODE_MAVLINK_TARGETING}"
+                        )
+                    )
+
+                if args.overlay:
+                    cv2.drawMarker(
+                        frame,
+                        (fx, fy),
+                        (255, 255, 0),
+                        markerType=cv2.MARKER_CROSS,
+                        markerSize=20,
+                        thickness=2,
+                    )
+                    cv2.putText(
+                        frame,
+                        "CENTER AXIS",
+                        (fx + 10, fy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                    if selected is not None:
+                        (x1, y1), (x2, y2) = selected["bbox"]
+                        tcx = int(round((x1 + x2) / 2.0))
+                        tcy = int(round((y1 + y2) / 2.0))
+                        cv2.circle(frame, (tcx, tcy), 5, (0, 0, 255), -1)
+                        cv2.line(frame, (fx, fy), (tcx, tcy), (0, 0, 255), 2)
+                        cv2.putText(
+                            frame,
+                            f"{move_label} yaw={current_yaw:.1f} pitch={current_pitch:.1f}",
+                            (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 0, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                    else:
+                        cv2.putText(
+                            frame,
+                            f"NO_TARGET (hold yaw={current_yaw:.1f} pitch={current_pitch:.1f})",
+                            (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 200, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+
                 frame = cv2.resize(frame, (WIDTH, HEIGHT))
                 if not frame.flags["C_CONTIGUOUS"]:
                     frame = frame.copy()
@@ -352,6 +529,11 @@ def main():
             stop_event.set()
             cap.release()
             writer.release()
+            if master is not None:
+                try:
+                    master.close()
+                except Exception:
+                    pass
 
     else:
         frame_interval = 1.0 / FPS
