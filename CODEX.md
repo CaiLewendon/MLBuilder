@@ -115,3 +115,58 @@ venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0
 
 ### Next technical milestone
 - Move from print-only gimbal command simulation to actual MAVLink transmission and verify real gimbal motion correctness (direction sign, clamp behavior, response smoothness).
+
+## 2026-05-12 Addendum: The "Wrong Model Deployed" Diagnosis
+
+### Executive summary
+After weeks of suspected quantization bugs, calibration problems, training-quality issues, and preprocessing regressions, the real cause turned out to be that **the Pi was loading a different int8 EdgeTPU model than the one we believed**. The model in production was never the `project1_prod` April-trained artifact. The code, the wrapper, the quantization math, and even the calibration set were all fine for the artifact actually deployed — but the artifact itself was the wrong one.
+
+### How the diagnosis fell out
+
+1. User reported `<0.005` confidences and "model stopped working" on the Pi.
+2. Initial hypothesis (wrong): the Pi `tflitemodel.py` was missing the input-quantization fix.
+3. User pasted the Pi's actual `tflitemodel.py` — it already had the proper input quantization and output dequantization, with the strict `[N,6]` branch gate.
+4. Added diagnostic prints to wrapper (`[TFLITEMODEL] Loaded from:`, ALLOCATE block) and ran on Pi.
+5. Live output `[OUT] shape=(1, 5, 8400) max=1.0073 mean=0.244` and stable 0.13-confidence detections proved the wrapper and dequant were healthy.
+6. Hashed the two int8 EdgeTPU artifacts on the Pi:
+   - `~/model_full_integer_quant_edgetpu.tflite` → `e4623d5d...`
+   - `~/target_detector_int8_edgetpu.tflite`     → `153b25f3...`
+7. Cross-referenced against repo artifacts:
+   - `e4623d5d...` = `export/model_full_integer_quant_edgetpu.tflite` (March 13 — OLD)
+   - `153b25f3...` = four byte-identical copies in repo: `target_detector_int8_edgetpu.tflite` (May 1), `export/project1_prod_full_integer_quant_edgetpu.tflite` (Apr 16), `export/project1_prod_int8_edgetpu_compat.tflite` (Apr 16), `export/pi_rebuild_edgetpu/target_detector_int8_edgetpu.tflite` (May 10)
+8. Probed non-edgetpu siblings to characterize each model:
+   - OLD: input `(0.01866, -14)`, output `(1,5,8400)` raw-head, `(0.00403, -126)`.
+   - NEW: input `(0.00392, -128)`, output `(1,300,6)` postprocessed, `(0.00402, -122)`.
+9. Conclusion: production has been running the pre-`project1_prod` March model the entire time. The newer model trained on the 492-image dataset has copies on the Pi but is not the one the script defaults to.
+
+### Critical artifact identification table
+
+| Hash prefix | Build date | Architecture | Trained on |
+|---|---|---|---|
+| `e4623d5d` | March 13 | raw-head `(1,5,8400)` | pre-project1_prod (legacy) |
+| `153b25f3` | April 16 / May 1 | postprocessed `(1,300,6)` w/ NMS | project1_prod, 492-image dataset |
+
+### Why earlier symptoms map to "wrong model"
+
+- "Confidences <0.005 on the Pi" — likely an earlier observation against a different model file at that path, or a sub-threshold view of the OLD model in a different scene.
+- "Model stopped working" episodes — file-mtime evidence shows the deployed `~/model_full_integer_quant_edgetpu.tflite` got overwritten at 2026-05-12 00:29:36 (same second as `tflitemodel.py`). The overwrite kept the hash `e4623d5d...` (no actual content change), but the wrapper update at the same second is what made the system behave consistently after.
+- "Clutter false positive at 0.13, weak far recall" — exactly the OLD model's behavior on a scene it was never trained for.
+- "Close target works at >0.50" — even a poorly-matched model can hit obvious targets.
+
+### Wrapper status (unchanged, verified correct)
+- `MLBuilder/model/tflite/tflitemodel.py` reads quant params from the model file at allocate time and applies the right transform on both ends.
+- Branch gate cleanly separates raw-head `[5,8400]` and postprocessed `[N,6]` outputs by `6 <= shape[1] <= 16 AND shape[0] > shape[1]`.
+- Same wrapper handles both OLD and NEW model files without modification — no code change needed when swapping the deployed model.
+- Diagnostic prints retained: `[TFLITEMODEL] Loaded from:` (module load), `[ALLOCATE] ...` (allocate time). Useful for any future "which file is loaded" question.
+
+### Things ruled out as causes (do not chase again)
+- `tflitemodel.py` input or output quantization bug — already fixed.
+- `(1,5,8400)` vs `[N,6]` branch routing — already correct.
+- 128×128 calibration NPY — never used by the deployed builds.
+- Video pipeline resolution mismatch — wrapper letterboxes internally.
+
+### Action items resulting from this session
+1. Swap deployed Pi model to the `153b25f3` artifact (already on the Pi at `~/target_detector_int8_edgetpu.tflite`).
+2. Add model-hash printing at script startup so any future deployment mismatch is visible immediately.
+3. Add regression tests for both decode branches.
+4. Treat `export/project1_prod_int8_edgetpu_compat.tflite` as the canonical repo source of the production model (user designation).

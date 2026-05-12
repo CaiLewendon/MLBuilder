@@ -1,6 +1,7 @@
 from typing import Literal, Optional, Union
 import numpy as np
 import cv2
+import os
 from MLBuilder.model.mlmodel import MLModel, system, allow, disallow
 
 try:
@@ -89,8 +90,11 @@ class TFLiteModel(MLModel):
 
         self._input_details = self._intepreter.get_input_details()
         self._output_detail = self._intepreter.get_output_details()
+        self._input_dtype = self._input_details[0]["dtype"]
+        self._input_quant = self._input_details[0].get("quantization", (0.0, 0))
+        self._output_quant = self._output_detail[0].get("quantization", (0.0, 0))
 
-        if self._input_details[0]["dtype"] in (np.float32, np.float16):
+        if self._input_dtype in (np.float32, np.float16):
             self._normalize = True
 
         self._started = True
@@ -130,19 +134,47 @@ class TFLiteModel(MLModel):
             value=(0, 0, 0),
         )
 
-        if self._normalize:
-            normalized_img = padded_image / 255
+        if self._input_dtype in (np.float32, np.float16):
+            model_input = (padded_image.astype(np.float32) / 255.0).astype(self._input_dtype)
+        elif self._input_dtype in (np.int8, np.uint8, np.int16, np.uint16):
+            q_scale, q_zero = self._input_quant
+            if q_scale is None or float(q_scale) <= 0.0:
+                raise RuntimeError(
+                    f"Invalid quantized input scale for dtype={self._input_dtype}: {q_scale}"
+                )
+            # Override for field debugging:
+            #   MLBUILDER_TFLITE_INPUT_REAL_SPACE=normalized|pixels|auto
+            mode = os.getenv("MLBUILDER_TFLITE_INPUT_REAL_SPACE", "auto").strip().lower()
+            if mode == "normalized":
+                real_input = padded_image.astype(np.float32) / 255.0
+            elif mode == "pixels":
+                real_input = padded_image.astype(np.float32)
+            else:
+                # Heuristic: small scales typically imply normalized [0,1] real-space input.
+                if float(q_scale) < 0.02:
+                    real_input = padded_image.astype(np.float32) / 255.0
+                else:
+                    real_input = padded_image.astype(np.float32)
+            q = np.round(real_input / float(q_scale) + float(q_zero))
+            limits = np.iinfo(self._input_dtype)
+            q = np.clip(q, limits.min, limits.max)
+            model_input = q.astype(self._input_dtype)
         else:
-            normalized_img = padded_image
+            model_input = padded_image.astype(self._input_dtype)
 
-        normalized_img = np.expand_dims(normalized_img, axis=0)
+        model_input = np.expand_dims(model_input, axis=0)
 
         self._intepreter.set_tensor(
             self._input_details[0]["index"],
-            normalized_img.astype(self._input_details[0]["dtype"]),
+            model_input,
         )
         self._intepreter.invoke()
         raw_out = self._intepreter.get_tensor(self._output_detail[0]["index"])
+        out_dtype = self._output_detail[0]["dtype"]
+        if out_dtype in (np.int8, np.uint8, np.int16, np.uint16):
+            out_scale, out_zero = self._output_quant
+            if out_scale is not None and float(out_scale) > 0.0:
+                raw_out = (raw_out.astype(np.float32) - float(out_zero)) * float(out_scale)
 
         if not nms:
             detections = raw_out[0]

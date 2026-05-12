@@ -160,3 +160,86 @@ venv/bin/python test/tf_live_infrence_drone_simulation.py --video 0 --sim-lidar-
 
 ### Next resumption target
 - Map this simulation state machine and control gains to real MAVLink position/yaw commands behind a guarded flag while preserving current visual/telemetry debug surfaces.
+
+## 2026-05-12 Session Addendum (Critical: Wrong Model Was Deployed)
+
+### TL;DR of the day
+The Pi production was running the WRONG int8 TPU model for weeks. Every "model quality" symptom — clutter false positives, weak far-target recall, <0.005 confidences on some attempts, "model stopped working" episodes — was rooted in a deployed-model mismatch, not in code, not in quantization, not in calibration math.
+
+### The two int8 EdgeTPU models — definitive identification
+
+**OLD model (`e4623d5d13c1f316c82b0f5a50d4079d9cfd7939cbfd197c11667a97068e1003`)**
+- Origin: March 13 training run, pre-`project1_prod` dataset.
+- Architecture: raw-head output `(1, 5, 8400)` — needs runtime NMS in wrapper.
+- Quantization: input `scale=0.01866, zero=-14`; output `scale=0.00403, zero=-126`.
+- Laptop path: `export/model_full_integer_quant_edgetpu.tflite`.
+- Pi path: `~/model_full_integer_quant_edgetpu.tflite` (this is what production script defaults to).
+- Last modified on Pi: 2026-05-12 00:29:36 (overwritten by an scp/rsync but same content as repo).
+- Training data: NOT the 492-image `project-1-at-2026-04-12-21-16-9fb8c3ae` dataset. Pre-relabel era.
+
+**NEW model (`153b25f30817c02075f2d8d06b8b5ea83cb0313dd3b705bd57038e6758fa39a2`) — THE GOOD ONE**
+- Origin: April `project1_prod` training run, exported Apr 16 + May 1.
+- Architecture: postprocessed output `(1, 300, 6)` — NMS baked into model.
+- Quantization: input `scale=0.00392, zero=-128` (≈ 1/255 standard); output `scale=0.00402, zero=-122`.
+- Calibration: 99 images (val split, per `build_project1_prod_int8.log`); below Ultralytics' >300 recommended threshold but on real project data.
+- Identical copies (byte-for-byte) at:
+  - `target_detector_int8_edgetpu.tflite` (repo root, May 1)
+  - `export/project1_prod_full_integer_quant_edgetpu.tflite` (Apr 16)
+  - `export/project1_prod_int8_edgetpu_compat.tflite` (Apr 16) ← **user-designated canonical best**
+  - `export/pi_rebuild_edgetpu/target_detector_int8_edgetpu.tflite` (May 10)
+- Pi paths where this model already exists: `~/target_detector_int8_edgetpu.tflite`, `~/project1_prod_int8_edgetpu_compat.tflite` (both hash 153b25...).
+- Training data: 492-image `project-1-at-2026-04-12-21-16-9fb8c3ae` dataset.
+
+### Production deployment fix (highest priority)
+On the Pi, the script defaults to `~/model_full_integer_quant_edgetpu.tflite` (the OLD March model). Two equivalent fixes:
+
+Option A — leave file alone, change command:
+```bash
+python3 -B tf_live_inferenceV2.py ~/target_detector_int8_edgetpu.tflite --tpu \
+  -l ../target_detector_labels.txt -p -o
+```
+
+Option B — swap the file (preserves command):
+```bash
+# On the Pi
+cp ~/model_full_integer_quant_edgetpu.tflite ~/model_full_integer_quant_edgetpu.tflite.OLD_march13_e4623d
+cp ~/target_detector_int8_edgetpu.tflite     ~/model_full_integer_quant_edgetpu.tflite
+```
+
+Verification: a successful swap shows `[OUT] shape=(1, 300, 6)` (not `(1, 5, 8400)`) on startup. That's the visual signature of the postprocessed-output architecture.
+
+### Wrapper status (`MLBuilder/model/tflite/tflitemodel.py`) — VERIFIED CORRECT
+- Reads input/output quantization params from the model file (not hard-coded).
+- Input preprocessing: normalize pixel `/255`, then `q = round(real/scale + zero)`, clip to dtype, cast. Correct for either model.
+- Output dequantization: `(raw - zero) * scale` when output is int8/uint8 and scale > 0. Correct for either model.
+- Branch gate distinguishes raw-head vs postprocessed: `6 <= shape[1] <= 16 AND shape[0] > shape[1]` → postprocessed `[N,6]` path; else raw-head `[5,8400]` path.
+- Same wrapper file handles both models without modification. This is verified by the 2026-05-12 Pi live run showing healthy outputs from the old model (max ≈ 1.007, mean ≈ 0.244, confidences in 0.13–0.50 range).
+- Diagnostic prints added today: `[TFLITEMODEL] Loaded from: ...` at module load; `[ALLOCATE] ...` at allocate time. These are observation-only and should remain.
+
+### Critical observations from the live Pi run (with OLD model loaded)
+- Close target: confidence > 0.50 (model works on obvious targets).
+- Persistent clutter detection: confidence ~0.13, bbox glued to near-identical coordinates frame after frame — the OLD model locked onto a static scene feature it weakly classified as `Target`.
+- Far target: weak recall, often filtered out below threshold.
+- This profile matches the project's long-standing "false positive on clutter + weak far-target recall" documented in earlier CODEX entries — because production was the SAME old model the whole time.
+
+### What changed at 2026-05-12 00:29:36 (same timestamp on Pi)
+Both `~/model_full_integer_quant_edgetpu.tflite` and `~/MLBuilder/MLBuilder/model/tflite/tflitemodel.py` were modified at the exact same second on the Pi — almost certainly an `scp`/`rsync` deploy from laptop. The wrapper update is what unblocked correct quant handling; the model file overwrite was a no-op in terms of content (same hash as `export/model_full_integer_quant_edgetpu.tflite` from March 13).
+
+### What was NEVER the cause (rule out for future debugging)
+- Input/output quantization in `tflitemodel.py` — handled correctly.
+- The `(5,8400)` decode branch gate — handled correctly.
+- The 128×128 calibration NPY at repo root — never used by the deployed int8 builds. Build log shows real `data.yaml`-based calibration.
+- Resolution mismatch in the video pipeline — irrelevant; wrapper letterboxes 1080p → 640×640 internally.
+- EdgeTPU compiler op fallback — not investigated but the OLD model dequantizes cleanly to [0,1.017], so head ops are healthy on TPU.
+
+### Known-good Pi production command (after swap to new model)
+```bash
+python3 -B tf_live_inferenceV2.py ~/target_detector_int8_edgetpu.tflite --tpu \
+  -l ../target_detector_labels.txt -p -o
+```
+Expected `[OUT] shape` line: `(1, 300, 6)`. Expected confidence range on real target: closer to laptop float16 (~0.4–0.8 on close, 0.2+ on far).
+
+### Next resumption target
+1. Swap model on Pi (Option A or B above) and validate `[OUT] shape=(1, 300, 6)` and improved real-target confidence.
+2. If still weak on far targets after swap: capture hard-negative footage of the false-positive clutter scene and add to training set. Retrain `project1_prod.pt` and re-export.
+3. The 492-image calibration rebuild (`test/rebuild_tpu_model_pi.py --data project-1-at-2026-04-12-21-16-9fb8c3ae/data_calib.yaml`) is now lower priority — only after we know the new model's real-world performance. Requires `edgetpu_compiler` on the laptop (not installed yet).

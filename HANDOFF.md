@@ -133,3 +133,50 @@ venv/bin/python test/tf_live_infrence_gimbal_simulation.py --video 0
 
 ### Next session first task
 - Implement and validate real MAVLink transmission for gimbal control on drone/sim while preserving the current detection defaults (especially center-crop pass).
+
+---
+
+## 11) 2026-05-12 Session Closeout (Wrong Model Deployed — Root Cause Found)
+
+### What was actually broken (and fixed)
+The Pi production was running the OLD March 13 int8 model (`e4623d5d...`) instead of the April `project1_prod`-trained model (`153b25f3...`). The newer model exists on the Pi already — `~/target_detector_int8_edgetpu.tflite` — but the production script's default model path points at the older artifact. Code, wrapper, quantization math, and calibration set were all fine for the artifact actually loaded — but the artifact itself was the wrong one.
+
+### What is verified correct (do not modify reflexively)
+- `MLBuilder/model/tflite/tflitemodel.py`: handles both `(1,5,8400)` raw-head and `(1,300,6)` postprocessed outputs. Reads quant params from the model file dynamically.
+- The branch gate invariant: `if out.ndim == 2 and 6 <= out.shape[1] <= 16 and out.shape[0] > out.shape[1]:` — still in place, still correct.
+- Diagnostic prints in `allocate()`: keep `[TFLITEMODEL] Loaded from:` and `[ALLOCATE] ...` to make future deployments self-identifying.
+
+### Canonical model artifact (per user designation, 2026-05-12)
+**`export/project1_prod_int8_edgetpu_compat.tflite`** (hash `153b25f30817c02075f2d8d06b8b5ea83cb0313dd3b705bd57038e6758fa39a2`) is the canonical production model. Byte-identical to three other files in the repo:
+- `target_detector_int8_edgetpu.tflite`
+- `export/project1_prod_full_integer_quant_edgetpu.tflite`
+- `export/pi_rebuild_edgetpu/target_detector_int8_edgetpu.tflite`
+
+This is the model trained on the 492-image `project-1-at-2026-04-12-21-16-9fb8c3ae` dataset. NMS is baked in (output is `(1, 300, 6)`).
+
+### Production command (after model swap on Pi)
+```bash
+python3 -B tf_live_inferenceV2.py ~/target_detector_int8_edgetpu.tflite --tpu \
+  -l ../target_detector_labels.txt -p -o
+```
+
+If swap was via file copy (Option B in CONTEXT.md), the original baseline command still works:
+```bash
+python3 -B tf_live_inferenceV2.py ~/model_full_integer_quant_edgetpu.tflite --tpu \
+  -l ../target_detector_labels.txt -p -o
+```
+
+### Visual signature of "right model loaded"
+- `[OUT] shape=(1, 300, 6)` — this is the NEW project1_prod model
+- `[OUT] shape=(1, 5, 8400)` — this is the OLD March model (do NOT ship)
+
+### Decision tree if confidence is still weak after swap
+1. Verify shape line is `(1, 300, 6)`. If not, the swap didn't take.
+2. If far targets still weak: it's a training-data problem (small/far target underrepresented in 492-image set). Capture more far-distance positives and hard-negative clutter from the deployment scene. Retrain `project1_prod.pt`, re-export.
+3. If false positives on clutter persist: add clutter scenes (target-absent) to training. Same retrain path.
+4. Optional intermediate: rebuild int8 with 492-image calibration instead of 99 (val-only). Artifacts ready at `project-1-at-2026-04-12-21-16-9fb8c3ae/data_calib.yaml`; requires `edgetpu_compiler` on laptop.
+
+### Lessons captured for future debugging
+- Always hash the deployed model before assuming code or quantization is the cause. The `sha256sum` step took 5 seconds and would have saved this entire investigation.
+- Two different models with similar names (`*_full_integer_quant_edgetpu.tflite`) caused the confusion. Prefer the explicit name `target_detector_int8_edgetpu.tflite` going forward.
+- Diagnostic prints in the wrapper (model path, quant params) are cheap and high-leverage; keep them.
