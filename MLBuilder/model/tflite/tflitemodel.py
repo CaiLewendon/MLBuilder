@@ -15,6 +15,8 @@ except ImportError:
     except ImportError:
         INTERPRETER_EXSITS = False
 
+print(f"[TFLITEMODEL] Loaded from: {__file__}")
+
 
 class TFLiteModel(MLModel):
     def __init__(self, path: str):
@@ -240,6 +242,8 @@ class TFLiteModel(MLModel):
             ) * self._output_quant_scale
 
         out = raw_out[0]
+
+        print(f"[OUT] shape={raw_out.shape} max={float(raw_out.max()):.4f} mean={float(raw_out.mean()):.4f}")
 
         # Postprocessed format: [N,6], but layout can vary by export/runtime:
         # [x1,y1,x2,y2,conf,cls] or [x1,y1,x2,y2,cls,conf]
