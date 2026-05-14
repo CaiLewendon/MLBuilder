@@ -243,3 +243,229 @@ Expected `[OUT] shape` line: `(1, 300, 6)`. Expected confidence range on real ta
 1. Swap model on Pi (Option A or B above) and validate `[OUT] shape=(1, 300, 6)` and improved real-target confidence.
 2. If still weak on far targets after swap: capture hard-negative footage of the false-positive clutter scene and add to training set. Retrain `project1_prod.pt` and re-export.
 3. The 492-image calibration rebuild (`test/rebuild_tpu_model_pi.py --data project-1-at-2026-04-12-21-16-9fb8c3ae/data_calib.yaml`) is now lower priority — only after we know the new model's real-world performance. Requires `edgetpu_compiler` on the laptop (not installed yet).
+
+## 2026-05-13 Session Addendum (FullDataSetProd: 3,487-image retrain + export)
+
+### Headline
+New, larger-dataset successor to `project1_prod` is trained and exported through int8 TFLite. Only the EdgeTPU compile step remains before Pi deployment. Pi production currently still runs OLD March model (`e4623d5d`); FullDataSetProd is intended to supersede both that and the project1_prod `153b25f3` artifact.
+
+### Dataset
+- Source: `project-1-at-2026-05-13-06-40-8e81e090/` — fresh Label Studio "YOLO with Images" export
+- **3,487 images** (7× the prior 492-image `project1_prod` dataset), single class `Target`, 1920×1080
+- 858 background-only images (no `Target` instance) — 24.6% explicit negatives
+- Original camera/source clip identity is NOT preserved in Label Studio filenames (UUID prefix + frame-number suffix only)
+
+### Scene-aware split (prevents val leakage from near-duplicate video frames)
+- Tool: `test/prepare_dataset_split.py` (numpy + PIL only, no extra deps)
+- Method: dhash (difference perceptual hash, 64-bit) → union-find by Hamming distance ≤ 5 → largest-first balanced bin packing to hit 80/20
+- Result: **2,790 train / 697 val** (exact 80/20), 1,026 clusters, 802 singletons
+- One unusually large cluster of **990 near-identical images** (~28% of dataset) was kept whole in train. Likely a near-stationary camera sequence. Implication: val (697 images, ~all other scenes) is a **pessimistic benchmark** — harder than typical production scenes.
+
+### Training (yolo11n base, matches project1_prod hyperparams)
+- Command:
+  ```bash
+  venv/bin/yolo detect train model=yolo11n.pt \
+    data=project-1-at-2026-05-13-06-40-8e81e090/data.yaml \
+    imgsz=640 epochs=40 batch=20 \
+    project=build/out name=FullDataSetProd
+  ```
+- Resolved hyperparams: AdamW, lr=0.002, momentum=0.9, AMP, default augmentations
+- Wall time: ~16 min on RTX 3070 Laptop (~26s/epoch), ~9 GB GPU memory peak
+- **Final val: P=0.956, R=0.85, mAP50=0.951, mAP50-95=0.719**
+
+### ⚠️ Gotcha: Ultralytics ignored project= argument
+- Ultralytics' `~/.config/Ultralytics/settings.json` has a `runs_dir` that overrode `project=build/out` — output landed in `/home/caile/Documents/MLBuilder/runs/detect/build/out/FullDataSetProd/` (note: NOT in `aerospace2025-26/`).
+- Promoted manually: `cp /home/caile/Documents/MLBuilder/runs/detect/build/out/FullDataSetProd/weights/best.pt export/FullDataSetProd.pt`
+
+### Export saga (OOM + dependency fix)
+- **First failure**: `AttributeError: module 'onnx.helper' has no attribute 'float32_to_bfloat16'` — `onnx_graphsurgeon` 0.5.8 incompatible with installed `onnx` 1.20.1. Fix: `pip install --upgrade onnx_graphsurgeon` → 0.6.1.
+- **Second failure (OOM)**: int8 calibration with the full 3,487-image set materializes the entire calibration tensor in memory (~17 GB at imgsz=640×640×3 float32). On a 16 GB laptop with VS Code open, systemd-oomd killed both yolo AND the Chromium process (VS Code crashed at the same time as the export). Two consecutive yolo OOM kills at 13 GB RSS confirmed in journalctl.
+- Fix: 500-image random subset (`project-1-at-2026-05-13-06-40-8e81e090/calib_subset_500.txt`, seeded `shuf`), referenced by `data_calib_subset.yaml`. Comfortably above Ultralytics' "300+ images" recommendation, peak ~3 GB calibration RAM. Successful export in ~35 min wall time.
+
+### Final artifacts (in `/home/caile/Documents/aerospace2025-26/MLBuilder/export/`)
+
+| File | Size | sha256 (full) | Input dtype | Output dtype | Output shape |
+|---|---|---|---|---|---|
+| `FullDataSetProd.pt` | 5.45 MB | `f213fdf4b4a30bf97ebc561a0148638a707b12c1015842053a925e0c3495e971` | (pytorch) | (pytorch) | `(1, 5, 8400)` |
+| `FullDataSetProd_last.pt` | 5.45 MB | `a464d96d832743c94842095e42512caf6bbfd688821b93eec9c3e2dfc6714d56` | (pytorch) | (pytorch) | `(1, 5, 8400)` |
+| `FullDataSetProd.onnx` | 10.69 MB | `547ec1ce0f1f0a9d90fa8dbda998b69c8a90d31d31bba6dfbd6af525743a5129` | float32 | float32 | `(1, 5, 8400)` |
+| `FullDataSetProd_saved_model/FullDataSetProd_float32.tflite` | 10.61 MB | `424173e5a932a818ec4e79da9dd0cdf4f3056eceea8944d1ab0851dc38198a04` | float32 | float32 | `(1, 5, 8400)` |
+| `FullDataSetProd_saved_model/FullDataSetProd_float16.tflite` | 5.36 MB | `5e5e795e1e3d1687a230f462342511d111a0007629f3341ea2017e6fb6c72f05` | float32 | float32 | `(1, 5, 8400)` |
+| `FullDataSetProd_saved_model/FullDataSetProd_integer_quant.tflite` | 2.94 MB | `e7a68aec7575b30ecda0b1ff942f48db656766165cb46cd3a1d2996a322affcc` | float32 | float32 | `(1, 5, 8400)` |
+| `FullDataSetProd_saved_model/FullDataSetProd_int8.tflite` | 2.98 MB | `392783403883bc090237dbf93a0634be075b6bdf3393aa20acd9fb4decb8a281` | float32 | float32 | `(1, 5, 8400)` |
+| **`FullDataSetProd_saved_model/FullDataSetProd_full_integer_quant.tflite`** | **2.94 MB** | **`db579abd1359952f48b9cb4e83c3ffaf3836c080e683bb04c25b8fa6b87f1534`** | **int8** | **int8** | **`(1, 5, 8400)`** |
+
+**Canonical EdgeTPU input** = `FullDataSetProd_full_integer_quant.tflite` (the only variant with int8 IO — required for the EdgeTPU compiler).
+- Input quantization: scale=`0.00392`, zero=`-128` (≈ standard 1/255 normalization)
+- Output quantization: scale=`0.003909`, zero=`-128`
+
+### ⚠️ Critical: output-shape signature changed from prior canonical
+- FullDataSetProd has output shape **`(1, 5, 8400)`** — raw head, NOT the postprocessed `(1, 300, 6)` of the canonical `project1_prod` (`153b25f3`).
+- This is because `nms=False` was passed to Ultralytics export (matches `test/rebuild_tpu_model_pi.py`'s default).
+- **Consequence**: On the Pi, FullDataSetProd will print `[OUT] shape=(1, 5, 8400)` — the same as the OLD broken March model (`e4623d5d`). The visual deployment fingerprint that previously distinguished `(1, 300, 6) = good` from `(1, 5, 8400) = bad` no longer works.
+- The wrapper (`MLBuilder/model/tflite/tflitemodel.py`) handles `(1, 5, 8400)` correctly via its raw-head decode branch — no code change needed.
+- **Deployment-identity policy going forward**: use `sha256sum` of the deployed model, not output shape. Future production startup print should emit hash.
+- Open decision (logged in KANBAN): re-export with `nms=True` to restore `(1, 300, 6)` signature for fingerprinting parity, or keep raw-head and rely on hash.
+
+### What still needs to happen on the laptop (for full handoff to Pi)
+1. Install `edgetpu_compiler` (not on laptop yet):
+   ```bash
+   curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+   echo "deb https://packages.cloud.google.com/apt coral-edgetpu-stable main" | sudo tee /etc/apt/sources.list.d/coral-edgetpu.list
+   sudo apt update && sudo apt install edgetpu-compiler
+   ```
+2. Compile:
+   ```bash
+   edgetpu_compiler -s -o export/FullDataSetProd_saved_model/ \
+     export/FullDataSetProd_saved_model/FullDataSetProd_full_integer_quant.tflite
+   ```
+   Produces `FullDataSetProd_full_integer_quant_edgetpu.tflite` in same dir.
+3. Pi deployment (BACK UP old file first):
+   ```bash
+   ssh pi 'cp ~/target_detector_int8_edgetpu.tflite ~/target_detector_int8_edgetpu.tflite.PROJECT1PROD_153b25f3_BACKUP'
+   scp export/FullDataSetProd_saved_model/FullDataSetProd_full_integer_quant_edgetpu.tflite \
+       pi@<PI>:~/FullDataSetProd_edgetpu.tflite
+   ```
+4. Run on Pi (new file path):
+   ```bash
+   python3 -B tf_live_inferenceV2.py ~/FullDataSetProd_edgetpu.tflite --tpu \
+     -l ../target_detector_labels.txt -p -o
+   ```
+   Expected `[OUT] shape=(1, 5, 8400)` (raw head). Verify hash of deployed file matches `db579abd...` truncated/post-compile, recorded after compile.
+
+### Pipeline learnings (record for future)
+- `onnx_graphsurgeon` version must keep up with `onnx` version — bump pre-emptively if `onnx.helper.float32_to_bfloat16` style errors appear
+- For Ultralytics int8 calibration on consumer hardware: cap calibration set at ~500 images. More doesn't materially help quant; less than 300 is below Ultralytics' recommendation.
+- Ultralytics' `~/.config/Ultralytics/settings.json` overrides `project=` — set it explicitly OR `unset` it before training.
+
+## 2026-05-13 Session Addendum (Manual Gimbal Control + Live Telemetry CLI)
+
+### Headline
+`test/manual_gimbal_control.py` is working well. It is the operator/bench tool for driving the gimbal directly and verifying MAVLink link health on the Pi. Same command shape as `tf_live_infrence_gimbal_live.py`; intent is to deploy and run **on the Pi** (not the laptop).
+
+### What it is
+- Continuous, single-keypress gimbal teleop (cbreak terminal mode — no Enter required)
+- Live, ANSI-refreshing telemetry panel for confirming the autopilot link is alive
+- Pure MAVLink — no camera, no inference, no GStreamer; only requires Python 3.9 + `pymavlink`
+
+### Control conventions (identical to `tf_live_infrence_gimbal_live.py`)
+- MAVLink message: `MAV_CMD_DO_MOUNT_CONTROL` (cmd 205) via `command_long_send`
+- `param1` = pitch deg (+ up, − down), `param3` = yaw deg (+ right, − left)
+- `param7` = `MAV_MOUNT_MODE_MAVLINK_TARGETING` (mode 2)
+- Limits: yaw ±90°, pitch ±45° (clamped client-side before send)
+- **Position-based** absolute angle command — script accumulates a setpoint locally and re-sends the absolute angle each tick
+
+### Keymap (single keypress, OS auto-repeat = continuous motion while held)
+- `w` / `s` — pitch up / down by `step`
+- `a` / `d` — yaw left / right by `step`
+- `c` — center (pitch=0, yaw=0)
+- `+` / `-` — increase / decrease step (range 0.5–30°)
+- `r` — force resend of current setpoint
+- `q` (or Ctrl-C) — quit
+
+### Telemetry surface (drained via `recv_match(blocking=False)`)
+Each row shows last-seen value + age, prefixed with `+` (fresh <2s) / `!` (stale) / `X` (never seen):
+- `HEARTBEAT` — confirms link, autopilot type, base/custom mode, system_status
+- `ATTITUDE` — drone roll/pitch/yaw (deg)
+- `SYS_STATUS` — battery V/I/%
+- `GLOBAL_POSITION_INT` — lat/lon/alt/relalt/hdg
+- `VFR_HUD` — airspeed/groundspeed/alt/climb/throttle/heading
+- `GPS_RAW_INT` — fix_type/sats/eph/epv
+- `MOUNT_STATUS` — autopilot's reported gimbal pitch/roll/yaw (this is the feedback to verify the command actually moved the gimbal)
+- `GIMBAL_DEVICE_ATTITUDE_STATUS` — MAVLink v2 quaternion → euler (alternate feedback path)
+- `RC_CHANNELS` — chan1-8 raw + rssi
+- `COMMAND_ACK` — confirms our `MAV_CMD_DO_MOUNT_CONTROL` is being accepted
+- `STATUSTEXT` — autopilot messages
+
+### Rates
+- Telemetry stream request: `MAV_DATA_STREAM_ALL` at 10 Hz on connect
+- Gimbal command send: up to 20 Hz on change + 2 Hz background resend (heartbeat) so the autopilot can't time out
+- Panel redraw: 10 Hz
+
+### Deployment
+This is the kind of file you **do** scp to the Pi (unlike inference scripts that live in the repo on the laptop):
+```bash
+# from laptop, in repo root
+scp test/manual_gimbal_control.py pi@10.42.0.1:~/
+```
+
+### Known-good run commands (on Pi)
+```bash
+python3 ~/manual_gimbal_control.py                                # default tcp:10.42.0.1:5760
+python3 ~/manual_gimbal_control.py --mavlink udpin:0.0.0.0:14550  # alt endpoint
+python3 ~/manual_gimbal_control.py --no-mavlink                   # offline panel test (no transmit)
+```
+
+### CLI flags
+- `--mavlink <conn>` — pymavlink connection string (default `tcp:10.42.0.1:5760`)
+- `--no-mavlink` — print-only dry-run
+- `--heartbeat-timeout` — seconds to wait for first heartbeat (default 15)
+- `--stream-rate` — requested telemetry stream rate Hz (default 10)
+- `--send-rate` — max gimbal command rate Hz (default 20)
+- `--heartbeat-send-rate` — background setpoint-resend Hz (default 2)
+- `--redraw-rate` — telemetry panel refresh Hz (default 10)
+- `--step` — degrees per keypress (default 2.0)
+- `--initial-pitch` / `--initial-yaw` — starting angles
+
+### Gimbal vs drone control conventions (clarification recorded here for future)
+- **Gimbal** = absolute position (`MAV_CMD_DO_MOUNT_CONTROL` sends absolute pitch/yaw degrees). What both `tf_live_infrence_gimbal_live.py` and this manual CLI do.
+- **Drone** = velocity-based (vector). `tf_live_infrence_drone_simulation.py` computes body-frame `vx` / `vz` / `yaw_rate` from yaw-error, lidar stand-off-error, and altitude-pixel-error. No real MAVLink sends in the sim — it integrates the velocities into an internal lidar/altitude model. When taken live, the natural translation is `SET_POSITION_TARGET_LOCAL_NED` in `MAV_FRAME_BODY_OFFSET_NED` with a type_mask that ignores position+accel and honors `vx/vy/vz` + `yaw_rate`.
+
+### Python compatibility note
+File uses `from __future__ import annotations` so `float | None` style PEP-604 union hints evaluate as strings. Confirmed to parse under Python 3.9 grammar (Pi runs 3.9.19).
+
+## 2026-05-14 — Autonomous gimbal automation (production)
+
+### File
+`test/tf_live_inferenceV2_gimbal_auto.py` — single production script. User-validated end-to-end (quote: "works amazingly").
+
+### Integration sources (combined, not refactored — each script remains)
+- V2 threaded inference (`test/tf_live_inferenceV2.py`)
+- Simulation gain law (`test/tf_live_infrence_gimbal_simulation.py`)
+- Manual-gimbal MAVLink plumbing (`test/manual_gimbal_control.py`)
+
+### Threading model
+| Thread | Role | Trigger | Rate |
+|---|---|---|---|
+| `capture_thread` | RTSP → `latest_frame[0]`, drop-old | continuous | camera-bound (~30 fps source) |
+| `inference_thread` | latest_frame → detections → setpoint via `link.update_setpoint(pitch, yaw)` | `frame_event` + seq-dedup | TPU-bound (~7 fps on Pi) |
+| `gimbal_tx_thread` | `MAV_CMD_DO_MOUNT_CONTROL` send | dirty bit OR heartbeat tick | `--send-rate` (20 Hz) when dirty / `--heartbeat-send-rate` (2 Hz) otherwise |
+| `gimbal_rx_thread` | drain inbox, log ACK/STATUSTEXT | blocking recv_match | autopilot-driven |
+| main | optional video writer | every frame | 10 fps when `--no-output` not set |
+
+### Control law (exact)
+| Step | Formula | Notes |
+|---|---|---|
+| Target center | `cx=(x1+x2)/2`, `cy=(y1+y2)/2` | from max-confidence bbox |
+| Normalized error | `err_x=(cx-W/2)/(W/2)`, `err_y=(cy-H/2)/(H/2)` | range `[-1, +1]`, resolution-independent |
+| Deadband | `\|err_x\| < 0.08 AND \|err_y\| < 0.08` → NO UPDATE | settles loop when target ~centered |
+| Gain (yaw) | `current_yaw += yaw_gain * err_x` | `yaw_gain=12` default; target-right → yaw-clockwise+ |
+| Gain (pitch) | `current_pitch -= pitch_gain * err_y` | `pitch_gain=10` default; image +y is down → subtract for gimbal +up |
+| Clamp | yaw `[-90, +90]`, pitch `[-45, +45]` | matches manual-gimbal limits |
+| MAVLink | `command_long(205, p1=pitch, p3=yaw, p7=2)` | `MAV_MOUNT_MODE_MAVLINK_TARGETING` |
+
+### Sign conventions (printed at startup, for verification)
+- image: +x=right, +y=down, center=(W/2, H/2)
+- gimbal yaw (param3): +right/clockwise, -left/counter-clockwise
+- gimbal pitch (param1): +up, -down
+- control: target right → yaw+, target left → yaw-, target down → pitch-, target up → pitch+
+
+### `--center-gimbal` mode
+Skips camera/TFLite/threading entirely. Connects MAVLink, sends `(pitch=0, yaw=0)` `--center-duration` × `--center-rate` packets (defaults 2s × 5 Hz = 10 packets), then exits. Honors `--no-mavlink` for dry-run.
+
+### Default args that work
+| Arg | Default | Why |
+|---|---|---|
+| `--deadband` | `0.08` | 8% of half-width = noise floor for jittery detections |
+| `--yaw-gain` | `12.0` | heuristic; conservative for stability without FOV calibration |
+| `--pitch-gain` | `10.0` | heuristic; slightly lower than yaw because pitch limit is tighter |
+| `--send-rate` | `20.0` Hz | fast enough that tracking lag is detection-bound not transmit-bound |
+| `--heartbeat-send-rate` | `2.0` Hz | matches `manual_gimbal_control.py`; keeps gimbal driver from timing out |
+| `--stream-rate` | `10` Hz | telemetry inbox rate request; matches manual-control |
+| `--heartbeat-timeout` | `15.0` s | wait for first FC heartbeat on connect |
+
+### Outstanding (next session)
+- **Gain tuning** — defaults are heuristic. FOV-calibrated mapping is `deg_err = pixel_err × HFOV/2`; deadbeat tracking wants `yaw_gain ≈ HFOV/2`, `pitch_gain ≈ VFOV/2`. Without HFOV/VFOV captured, leaving as-is.
+- **Gimbal feedback** — currently open-loop on MAVLink ACK only. `MOUNT_STATUS` and `GIMBAL_DEVICE_ATTITUDE_STATUS` are received and logged by `run_rx_loop` but not used for closed-loop verification.
+- **PWM fallback** — user asked about `MAV_CMD_DO_SET_SERVO`-based centering, then redirected. Pitch/yaw servo channels and neutral PWM values not yet captured.
+- **Earth-frame stabilization** — not compensating airframe roll/pitch from `ATTITUDE`. Body-frame only.

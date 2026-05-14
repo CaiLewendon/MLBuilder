@@ -1,0 +1,6 @@
+path: /home/caile/Documents/aerospace2025-26/MLBuilder/project-1-at-2026-05-13-06-40-8e81e090
+train: calib_subset_500.txt
+val: calib_subset_500.txt
+
+names:
+  0: Target

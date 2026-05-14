@@ -1,5 +1,31 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
+## ⏸ WHERE WE LEFT OFF (2026-05-14 — autonomous gimbal script working)
+**Last action:** Built `test/tf_live_inferenceV2_gimbal_auto.py` — a single production script combining V2's threaded inference, the simulation script's deadband+gain control law, and the manual-gimbal script's MAVLink connection/telemetry/transmit threading. User ran it end-to-end and confirmed it **works**. Quote: *"that script works amazingly. it just needs some logic tuning and gain control on the movement and mapping, but other than that its great."* Added a `--center-gimbal` early-exit mode that skips inference and just emits `MAV_CMD_DO_MOUNT_CONTROL(pitch=0, yaw=0)` for a configurable duration. Also installed `ailearn.sh` at repo root (was missing from this repo though present in sibling projects).
+
+**What's left (next session):** tune `--yaw-gain` (default 12) and `--pitch-gain` (default 10) — they're heuristic, not FOV-calibrated. Possibly add FOV-based mapping (`pixel_err × HFOV/2 = deg_err`), gimbal feedback closed-loop via `MOUNT_STATUS`/`GIMBAL_DEVICE_ATTITUDE_STATUS`, or earth-frame stabilization. **User briefly asked about PWM-based centering then redirected to mapping discussion — PWM option still on the table.**
+
+**Working artifacts on disk:**
+- `test/tf_live_inferenceV2_gimbal_auto.py` — new production script (this session).
+- `test/tf_live_inferenceV2.py` — prior V2 inference (still valid for inference-only deployments without gimbal).
+- `ailearn.sh` at repo root (added this session; copy of UAS_Competition_task_1_2026 version).
+
+**Pi commands**:
+```bash
+# Live autonomous gimbal tracking (production)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output --mavlink tcp:10.42.0.1:5760
+
+# Bench dry-run (no autopilot)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output --no-mavlink
+
+# Center gimbal and exit (no model/camera needed)
+python3 -B tf_live_inferenceV2_gimbal_auto.py --center-gimbal --mavlink tcp:10.42.0.1:5760
+```
+
+Output shape `(1, 5, 8400)` is INTENTIONAL — see `feedback_hash_not_shape` memory before assuming the wrong model is loaded.
+
+---
+
 ## Read these first (in this order)
 1. This file (you're here).
 2. `CONTEXT.md` — deployment topology, model artifacts, latest session state.

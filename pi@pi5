@@ -1,0 +1,292 @@
+"""
+Manual CLI gimbal control.
+
+Same MAVLink command shape as tf_live_infrence_gimbal_live.py
+(MAV_CMD_DO_MOUNT_CONTROL, pitch on param1, yaw on param3, MAVLINK_TARGETING mode).
+Replaces the inference-driven angle update with keyboard commands so the
+gimbal can be exercised directly from a terminal.
+"""
+
+import argparse
+import sys
+
+GIMBAL_YAW_MIN_DEG = -90.0
+GIMBAL_YAW_MAX_DEG = 90.0
+GIMBAL_PITCH_MIN_DEG = -45.0
+GIMBAL_PITCH_MAX_DEG = 45.0
+MAV_CMD_DO_MOUNT_CONTROL = 205
+MAV_MOUNT_MODE_MAVLINK_TARGETING = 2
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def send_mount_control(master, pitch_deg: float, yaw_deg: float) -> None:
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_MOUNT_CONTROL,
+        0,
+        float(pitch_deg),
+        0.0,
+        float(yaw_deg),
+        0.0,
+        0.0,
+        0.0,
+        float(MAV_MOUNT_MODE_MAVLINK_TARGETING),
+    )
+
+
+HELP_TEXT = """\
+Commands (case-insensitive, whitespace-separated):
+  w / s            pitch up / pitch down by current step
+  a / d            yaw left / yaw right by current step
+  c                center (pitch=0, yaw=0)
+  set <pitch> <yaw>   absolute angles in degrees
+  pitch <deg>      absolute pitch only
+  yaw <deg>        absolute yaw only
+  step <deg>       change step size for w/a/s/d
+  send             resend current angles (e.g. after autopilot reset)
+  status           print current angles and step
+  h / help         show this help
+  q / quit         exit
+
+Limits: yaw [{ymin:+.0f}, {ymax:+.0f}] deg, pitch [{pmin:+.0f}, {pmax:+.0f}] deg
+Axis convention (matches tf_live_infrence_gimbal_live.py):
+  pitch (param1): +up,    -down
+  yaw   (param3): +right, -left
+""".format(
+    ymin=GIMBAL_YAW_MIN_DEG,
+    ymax=GIMBAL_YAW_MAX_DEG,
+    pmin=GIMBAL_PITCH_MIN_DEG,
+    pmax=GIMBAL_PITCH_MAX_DEG,
+)
+
+
+def parse_float(token: str) -> float | None:
+    try:
+        return float(token)
+    except (TypeError, ValueError):
+        return None
+
+
+def print_status(pitch: float, yaw: float, step: float) -> None:
+    print(f"[STATE] pitch={pitch:+.2f} yaw={yaw:+.2f} step={step:.2f}")
+
+
+def transmit(master, pitch: float, yaw: float, label: str) -> None:
+    print(
+        f"[CMD] {label} -> pitch={pitch:+.2f} yaw={yaw:+.2f} "
+        f"CMD_LONG cmd={MAV_CMD_DO_MOUNT_CONTROL} "
+        f"param1={pitch:.2f} param2=0.00 param3={yaw:.2f} "
+        f"param4=0.00 param5=0.00 param6=0.00 "
+        f"param7={MAV_MOUNT_MODE_MAVLINK_TARGETING}"
+    )
+    if master is None:
+        return
+    try:
+        send_mount_control(master, pitch, yaw)
+    except Exception as e:
+        print(f"[MAVLINK] send_mount_control failed: {e}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="manual_gimbal_control",
+        description="Console-driven gimbal control using MAV_CMD_DO_MOUNT_CONTROL.",
+    )
+    parser.add_argument(
+        "--mavlink",
+        type=str,
+        default="tcp:10.42.0.1:5760",
+        help="pymavlink connection string (default: tcp:10.42.0.1:5760)",
+    )
+    parser.add_argument(
+        "--no-mavlink",
+        action="store_true",
+        help="Do not open a MAVLink connection; print commands only (dry-run).",
+    )
+    parser.add_argument(
+        "--heartbeat-timeout",
+        type=float,
+        default=15.0,
+        help="Seconds to wait for the first heartbeat (default: 15).",
+    )
+    parser.add_argument(
+        "--step",
+        type=float,
+        default=5.0,
+        help="Initial step size in degrees for w/a/s/d (default: 5.0).",
+    )
+    parser.add_argument(
+        "--initial-pitch",
+        type=float,
+        default=0.0,
+        help="Initial pitch angle in degrees (default: 0.0).",
+    )
+    parser.add_argument(
+        "--initial-yaw",
+        type=float,
+        default=0.0,
+        help="Initial yaw angle in degrees (default: 0.0).",
+    )
+    args = parser.parse_args()
+
+    if args.step <= 0:
+        parser.error("--step must be > 0")
+
+    master = None
+    if not args.no_mavlink:
+        try:
+            from pymavlink import mavutil
+        except ImportError:
+            print("[MAVLINK] pymavlink not installed. Re-run with --no-mavlink for dry-run.")
+            return 2
+
+        print(f"[MAVLINK] Connecting: {args.mavlink}")
+        try:
+            master = mavutil.mavlink_connection(args.mavlink)
+            master.wait_heartbeat(timeout=args.heartbeat_timeout)
+            print(
+                f"[MAVLINK] heartbeat sysid={master.target_system} "
+                f"compid={master.target_component}"
+            )
+        except Exception as e:
+            print(f"[MAVLINK] WARNING: connection/heartbeat failed: {e}")
+            print("[MAVLINK] Continuing without transmission (commands will only be printed).")
+            master = None
+    else:
+        print("[MAVLINK] Disabled via --no-mavlink (no commands will be sent)")
+
+    pitch = clamp(args.initial_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+    yaw = clamp(args.initial_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+    step = float(args.step)
+
+    print(HELP_TEXT)
+    print_status(pitch, yaw, step)
+    transmit(master, pitch, yaw, "INITIAL")
+
+    try:
+        while True:
+            try:
+                raw = input("gimbal> ").strip()
+            except EOFError:
+                print()
+                break
+            if not raw:
+                continue
+
+            tokens = raw.split()
+            cmd = tokens[0].lower()
+            args_tail = tokens[1:]
+
+            new_pitch = pitch
+            new_yaw = yaw
+            label = None
+
+            if cmd in ("q", "quit", "exit"):
+                break
+            elif cmd in ("h", "help", "?"):
+                print(HELP_TEXT)
+                continue
+            elif cmd == "status":
+                print_status(pitch, yaw, step)
+                continue
+            elif cmd == "send":
+                label = "RESEND"
+            elif cmd == "c" or cmd == "center" or cmd == "home":
+                new_pitch = 0.0
+                new_yaw = 0.0
+                label = "CENTER"
+            elif cmd == "w":
+                new_pitch = pitch + step
+                label = f"PITCH+{step:.2f}"
+            elif cmd == "s":
+                new_pitch = pitch - step
+                label = f"PITCH-{step:.2f}"
+            elif cmd == "a":
+                new_yaw = yaw - step
+                label = f"YAW-{step:.2f}"
+            elif cmd == "d":
+                new_yaw = yaw + step
+                label = f"YAW+{step:.2f}"
+            elif cmd == "step":
+                if len(args_tail) != 1:
+                    print("usage: step <deg>")
+                    continue
+                val = parse_float(args_tail[0])
+                if val is None or val <= 0:
+                    print("step must be a positive number")
+                    continue
+                step = val
+                print_status(pitch, yaw, step)
+                continue
+            elif cmd == "set":
+                if len(args_tail) != 2:
+                    print("usage: set <pitch> <yaw>")
+                    continue
+                p = parse_float(args_tail[0])
+                y = parse_float(args_tail[1])
+                if p is None or y is None:
+                    print("set: pitch and yaw must be numbers")
+                    continue
+                new_pitch = p
+                new_yaw = y
+                label = "SET"
+            elif cmd == "pitch":
+                if len(args_tail) != 1:
+                    print("usage: pitch <deg>")
+                    continue
+                p = parse_float(args_tail[0])
+                if p is None:
+                    print("pitch: value must be a number")
+                    continue
+                new_pitch = p
+                label = "SET_PITCH"
+            elif cmd == "yaw":
+                if len(args_tail) != 1:
+                    print("usage: yaw <deg>")
+                    continue
+                y = parse_float(args_tail[0])
+                if y is None:
+                    print("yaw: value must be a number")
+                    continue
+                new_yaw = y
+                label = "SET_YAW"
+            else:
+                print(f"unknown command: {cmd!r}. type 'h' for help.")
+                continue
+
+            clamped_pitch = clamp(new_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+            clamped_yaw = clamp(new_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+            if clamped_pitch != new_pitch:
+                print(
+                    f"[CLAMP] pitch {new_pitch:+.2f} -> {clamped_pitch:+.2f} "
+                    f"(limits {GIMBAL_PITCH_MIN_DEG:+.0f}..{GIMBAL_PITCH_MAX_DEG:+.0f})"
+                )
+            if clamped_yaw != new_yaw:
+                print(
+                    f"[CLAMP] yaw {new_yaw:+.2f} -> {clamped_yaw:+.2f} "
+                    f"(limits {GIMBAL_YAW_MIN_DEG:+.0f}..{GIMBAL_YAW_MAX_DEG:+.0f})"
+                )
+
+            pitch = clamped_pitch
+            yaw = clamped_yaw
+            transmit(master, pitch, yaw, label or "UPDATE")
+            print_status(pitch, yaw, step)
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted, exiting.")
+    finally:
+        if master is not None:
+            try:
+                master.close()
+            except Exception:
+                pass
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

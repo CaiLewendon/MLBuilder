@@ -170,3 +170,75 @@ After weeks of suspected quantization bugs, calibration problems, training-quali
 2. Add model-hash printing at script startup so any future deployment mismatch is visible immediately.
 3. Add regression tests for both decode branches.
 4. Treat `export/project1_prod_int8_edgetpu_compat.tflite` as the canonical repo source of the production model (user designation).
+
+## 2026-05-13 Addendum: FullDataSetProd (3,487-image retrain + export)
+
+### Executive summary
+Trained a new, larger-dataset successor to `project1_prod` named `FullDataSetProd` from a 3,487-image Label Studio export (7× prior). Final val mAP50=0.951, mAP50-95=0.719. All int8 + float TFLite variants exported. Only the EdgeTPU compile step remains before deployment to the Pi.
+
+### Chronological session events
+1. New Label Studio export landed at `project-1-at-2026-05-13-06-40-8e81e090/` (zip 372 MB, 3,487 images, single class `Target`).
+2. Verified export format matches prior `project-1-at-2026-04-12-21-16-9fb8c3ae/` (YOLO with Images). Missing `data.yaml` and `train.txt`/`val.txt` — Label Studio doesn't ship those.
+3. Filename inspection: each image has unique UUID prefix; no clip-identifying suffix. Random split would risk near-duplicate video-frame leakage.
+4. Wrote `test/prepare_dataset_split.py` — dhash (numpy + PIL only) → union-find clustering → balanced bin packing. Initial run at Hamming threshold 8 over-chained clusters (greedy fill assigned 38% to val). Tightened to threshold 5 + largest-first balanced assignment → exact 80/20 split, 1,026 clusters, largest 990-image cluster kept whole in train.
+5. Trained `FullDataSetProd` matching project1_prod hyperparams (yolo11n, imgsz=640, batch=20, epochs=40, AdamW lr=0.002, AMP).
+6. Training wall-time ~16 min. Per-epoch mAP50 climbed from 0.63 (epoch 1) to plateau around 0.91–0.93 by epoch 13. Final reported val: P=0.956, R=0.85, mAP50=0.951, mAP50-95=0.719.
+7. **Surprise**: Ultralytics ignored `project=build/out` argument. Output landed at `/home/caile/Documents/MLBuilder/runs/detect/build/out/FullDataSetProd/` (different dir entirely). Cause: `~/.config/Ultralytics/settings.json` `runs_dir` setting overrode CLI arg. Worked around by promoting `best.pt` to `export/FullDataSetProd.pt`.
+8. **Failure #1: onnx_graphsurgeon import-time crash**. Symptom: int8 export silently exited after labels.cache scan with no error in the log. Root cause via interactive `import onnx2tf`: `AttributeError: module 'onnx.helper' has no attribute 'float32_to_bfloat16'`. `onnx_graphsurgeon` 0.5.8 used a function removed in newer `onnx` versions. Fix: `pip install --upgrade onnx_graphsurgeon` → 0.6.1.
+9. **Failure #2: OOM**. After fix #1, int8 export crashed again. journalctl showed `Out of memory: Killed process yolo total-vm:33GB, anon-rss:13GB` — twice. Same OOM event killed Chromium (VS Code), which the user observed as "VS Code crashed too." Root cause: Ultralytics materializes the entire int8 calibration set in memory as float32 numpy tensors — 3,487 × 640 × 640 × 3 × 4 bytes ≈ 17 GB on a 16 GB system.
+10. Fix: 500-image deterministic random subset of `calib_all.txt` (`shuf --random-source=<(yes 0) -n 500`) → `calib_subset_500.txt` → `data_calib_subset.yaml`. Above Ultralytics' "300+ images" recommendation, ~3 GB calibration RAM peak. Export completed in ~35 min wall time.
+11. All TFLite variants produced in `export/FullDataSetProd_saved_model/`. Full hash + IO dtype table in CONTEXT 2026-05-13 addendum.
+12. **Critical finding**: Output shape is `(1, 5, 8400)` (raw head) for all FullDataSetProd variants, NOT `(1, 300, 6)` like the prior canonical `project1_prod`. Cause: `nms=False` Ultralytics flag (matches `test/rebuild_tpu_model_pi.py`'s default). The wrapper handles raw-head correctly via its existing branch gate, but the visual deployment fingerprint `(1, 300, 6) = good vs (1, 5, 8400) = bad` no longer holds. Identity must be verified by sha256 hash going forward.
+
+### Lessons captured
+- **Always pin `onnx_graphsurgeon` version to track `onnx`** — they release versions in lockstep; mismatch = silent onnx2tf import failure that surfaces as "export hangs after labels.cache scan."
+- **Cap int8 calibration set at ~500 images** on consumer 16 GB hardware. Above this, Ultralytics' in-memory tensor allocation triggers OOM. Below 300, you fall under Ultralytics' "recommend more" warning. 500 = sweet spot.
+- **Ultralytics' `~/.config/Ultralytics/settings.json` is sticky** — it overrides `project=` CLI args. Either edit it once or always check `find / -name "best.pt"` after a training run to locate output.
+- **OOM kills are correlated, not isolated** — a runaway calibration job will take down whatever other RAM-hungry process (browser, IDE) is co-resident in the cgroup. Close those before launching int8 calibration.
+- **`nms=False` on export → raw-head output `(1, N_pred, N_anchors)`**; `nms=True` → postprocessed `(1, 300, 6)`. Choose deliberately based on deployment fingerprinting + wrapper expectation.
+
+## 2026-05-14: Autonomous gimbal automation script (USER-VALIDATED, WORKING)
+
+### Executive summary
+Built `test/tf_live_inferenceV2_gimbal_auto.py` — a single production script combining all three previously separate concerns: V2 threaded inference, simulation gimbal control law, and manual-gimbal MAVLink plumbing. End-to-end run reported as working ("works amazingly"). Outstanding work is purely tuning (gains + mapping refinement), not architecture.
+
+### What it integrates (per user request: "uses the processing of V2, the gimbal logic of simulation, and the connection of the manual gimbal for the flight computer")
+| Source script | What was lifted |
+|---|---|
+| `test/tf_live_inferenceV2.py` | `pipeline3`/`pipeline4` GStreamer strings, FPS=10/W=1920/H=1080 constants, capture+inference threads with seq-dedup, `--no-output` flag path, `filter_detections`, dual `crop_at` passes, CLAHE preprocessing, `frame_event` + `frame_seq` shared state pattern |
+| `test/tf_live_infrence_gimbal_simulation.py` | `clamp`, `direction_label`, deadband math, cumulative-P gain law (`current_yaw += yaw_gain * err_x`, `current_pitch -= pitch_gain * err_y`), gimbal limits `±90° yaw / ±45° pitch`, axis-convention preamble print, log line format `[F######] target_bbox=... CMD_LONG cmd=205 paramN=...` |
+| `test/manual_gimbal_control.py` | `pymavlink` connect with `wait_heartbeat(timeout)`, `request_streams(MAV_DATA_STREAM_ALL @ stream_rate)`, separate transmit thread pattern (dirty bit + send-rate + heartbeat-resend-rate), `send_mount_control` exact wire format, `COMMAND_ACK`/`STATUSTEXT` inbox-drain loop |
+
+### Threading architecture (the part the user said works amazingly)
+Four daemon threads talking through three locks:
+1. `capture_thread` — RTSP → `latest_frame[0]` (single-slot, drop-old). Signals `frame_event`.
+2. `inference_thread` — wakes on `frame_event`, dedupes via `frame_seq[0]` (skips if seq unchanged), runs TFLite + optional crop passes + filter, picks max-confidence detection, computes new `(pitch, yaw)` setpoint via gain law, calls `link.update_setpoint(pitch, yaw)`.
+3. `gimbal_tx_thread` (`GimbalLink.run_tx_loop`) — independent cadence. Transmits at `--send-rate` (default 20 Hz) when dirty bit is set, otherwise re-sends last setpoint at `--heartbeat-send-rate` (default 2 Hz). This keeps the autopilot/gimbal driver fed even when target is centered (no motion needed) or lost (HOLD).
+4. `gimbal_rx_thread` (`GimbalLink.run_rx_loop`) — drains MAVLink inbox so the socket buffer can't fill. Logs `COMMAND_ACK` for cmd 205 and `STATUSTEXT` at any severity; everything else is silently consumed.
+
+Main thread is the optional video writer (skipped under `--no-output`).
+
+### Control mapping (pixels → MAVLink) — exact chain documented in this session
+1. Top-confidence detection → bbox center `(cx, cy)` in OpenCV pixel coords (origin top-left, +x right, +y down).
+2. Frame center `(fx, fy) = (W/2, H/2)`. Normalized error `err_x = (cx-fx)/fx`, `err_y = (cy-fy)/fy`. Range `[-1, +1]`, FPS+resolution independent.
+3. Deadband: `|err_x| < 0.08 AND |err_y| < 0.08` → `direction_label="CENTERED"` → **no setpoint update** (this is how the loop settles).
+4. Outside deadband:
+   - `current_yaw   += yaw_gain * err_x` (target right → err_x +, yaw clockwise +)
+   - `current_pitch -= pitch_gain * err_y` (target down → err_y +, pitch -, because image +y is down while gimbal +pitch is up)
+5. Clamp to `[-90, +90]` yaw, `[-45, +45]` pitch.
+6. `link.update_setpoint(pitch, yaw)` — sets dirty bit, tx thread picks it up.
+7. tx thread emits `MAV_CMD_DO_MOUNT_CONTROL(205)` with `param1=pitch, param3=yaw, param7=MAVLINK_TARGETING(2)`.
+
+### `--center-gimbal` mode (added mid-session)
+Skips camera/TFLite/threading entirely. Connects MAVLink → calls `center_gimbal(master, duration, rate, dry_run)` → exits. Sends `(0, 0)` `--center-duration` × `--center-rate` times (defaults 2.0s × 5 Hz = 10 packets) because single-packet drops are common on the link and the gimbal driver expects sustained traffic to settle on a new setpoint. Honors `--no-mavlink` for bench dry-run.
+
+### What does NOT work yet (intentional gaps, user-flagged)
+- **Gains are not FOV-calibrated.** `yaw_gain=12` and `pitch_gain=10` are heuristic. A target at `err_x=1.0` (right edge) commands +12° yaw, but the actual angular offset of that pixel depends on the camera's horizontal FOV. Deadbeat tracking would require `yaw_gain ≈ HFOV/2` deg.
+- **No gimbal feedback closed-loop.** `run_rx_loop` reads `MOUNT_STATUS` and `GIMBAL_DEVICE_ATTITUDE_STATUS` if present but doesn't compare commanded vs measured.
+- **Body frame, not earth frame.** No roll/pitch compensation from airframe ATTITUDE.
+- **No PWM fallback.** User asked about PWM-based centering mid-session, then redirected to mapping discussion before answering channel/neutral questions. Option remains open.
+
+### Files this session
+- New: `test/tf_live_inferenceV2_gimbal_auto.py` (~530 lines)
+- New: `ailearn.sh` at repo root (copied from `~/Documents/aerospace2025-26/UAS_Competition_task_1_2026/CODEX/ailearn.sh`; was missing from this repo)
+- Regenerated: `CODEX/AILEARN_REPORT.md`
