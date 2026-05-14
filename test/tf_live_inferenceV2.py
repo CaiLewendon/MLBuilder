@@ -28,16 +28,17 @@ COCO80_NAMES = [
 ]
 
 pipeline3 = (
-    "rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=0 !"
-    "rtph264depay !"
-    "h264parse !"
-    "avdec_h264 !"
-    "videoconvert !"
+    "rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! "
+    "rtpjitterbuffer latency=200 ! "
+    "rtph264depay ! "
+    "h264parse ! "
+    "avdec_h264 ! "
+    "videoconvert ! "
     "appsink drop=true max-buffers=1 sync=false"
 )
 
 pipeline4 = (
-    "appsrc ! "
+    "appsrc is-live=true do-timestamp=true block=false max-bytes=20000000 format=time ! "
     "queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! "
     "videoconvert ! "
     "video/x-raw,format=I420 ! "
@@ -92,11 +93,6 @@ def filter_detections(detections, frame, min_conf=0.05, max_area_ratio=0.35, edg
         bw = max(1, x2 - x1)
         bh = max(1, y2 - y1)
 
-        # reject elongated/flat blobs (target should be roughly round)
-        # aspect = bw / max(1.0, bh)
-        # if aspect < 0.65 or aspect > 1.45:
-        #     continue
-
         area_ratio = (bw * bh) / frame_area
         touches_edge = (x1 <= mx) or (y1 <= my) or (x2 >= (w - 1 - mx)) or (y2 >= (h - 1 - my))
 
@@ -146,13 +142,12 @@ def main():
     parser.add_argument("--labels", "-l", type=str, default=None)
     parser.add_argument("--process", "-p", action="store_true", help="Enable inference processing")
     parser.add_argument("--overlay", "-o", action="store_true", help="Draw detection labels/boxes on output video")
+    parser.add_argument("--no-output", action="store_true", help="Disable video output stream (capture + inference only, no writer)")
 
-    # Filtering knobs
     parser.add_argument("--min-conf", type=float, default=0.05, help="Post-filter minimum confidence")
     parser.add_argument("--max-area-ratio", type=float, default=0.35, help="Reject boxes larger than this frame-area ratio")
     parser.add_argument("--edge-margin-ratio", type=float, default=0.01, help="Edge margin ratio for edge-touch rejection")
 
-    # Crop pass knobs
     parser.add_argument("--center-crop-pass", action="store_true", help="Run second inference pass on a crop")
     parser.add_argument("--center-crop-ratio", type=float, default=0.5, help="Primary crop ratio (0<ratio<=1)")
     parser.add_argument("--crop-center-x", type=float, default=0.5, help="Primary crop center x in [0,1]")
@@ -163,7 +158,6 @@ def main():
     parser.add_argument("--second-crop-center-x", type=float, default=0.55, help="Second crop center x in [0,1]")
     parser.add_argument("--second-crop-center-y", type=float, default=0.35, help="Second crop center y in [0,1]")
 
-    # Contrast enhancement
     parser.add_argument("--clahe", action="store_true", help="Enable CLAHE contrast enhancement before inference")
     parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clip limit")
     parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE grid size")
@@ -190,10 +184,14 @@ def main():
     cap = cv2.VideoCapture(pipeline3, cv2.CAP_GSTREAMER)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    writer = cv2.VideoWriter(pipeline4, cv2.CAP_GSTREAMER, 0, FPS, (WIDTH, HEIGHT), True)
+    writer = None
+    if not args.no_output:
+        writer = cv2.VideoWriter(pipeline4, cv2.CAP_GSTREAMER, 0, FPS, (WIDTH, HEIGHT), True)
+        if not writer.isOpened():
+            raise RuntimeError("Failed to open GStreamer VideoWriter")
+    else:
+        print("[NO-OUTPUT] writer disabled; capture + inference only", flush=True)
 
-    if not writer.isOpened():
-        raise RuntimeError("Failed to open GStreamer VideoWriter")
     if not cap.isOpened():
         print("Error: Could not open video stream.")
         exit()
@@ -216,6 +214,8 @@ def main():
         stop_event = threading.Event()
         frame_event = threading.Event()
 
+        frame_seq = [0]
+
         def capture_thread():
             skip = 0
             while not stop_event.is_set():
@@ -229,24 +229,27 @@ def main():
                 skip = 0
                 with frame_lock:
                     latest_frame[0] = frame
+                    frame_seq[0] += 1
                 frame_event.set()
 
         def inference_thread():
             count = 0
+            last_seen = 0
             while not stop_event.is_set():
                 frame_event.wait(timeout=0.1)
                 frame_event.clear()
 
                 with frame_lock:
                     frame = latest_frame[0]
-                if frame is None:
+                    seq = frame_seq[0]
+                if frame is None or seq == last_seen:
                     continue
+                last_seen = seq
 
                 infer_frame = frame
                 if args.clahe:
                     infer_frame = apply_clahe_bgr(
-                        infer_frame,
-                        clip_limit=args.clahe_clip_limit,
+                        infer_frame, clip_limit=args.clahe_clip_limit,
                         grid_size=args.clahe_grid,
                     )
 
@@ -254,27 +257,22 @@ def main():
 
                 if args.center_crop_pass:
                     crop, x_off, y_off = crop_at(
-                        infer_frame,
-                        args.center_crop_ratio,
-                        args.crop_center_x,
-                        args.crop_center_y,
+                        infer_frame, args.center_crop_ratio,
+                        args.crop_center_x, args.crop_center_y,
                     )
                     raw_crop = m.detect(crop, nms=args.nms, tol=args.confidence)
                     raw.extend(remap_detections(raw_crop, x_off, y_off))
 
                 if args.second_crop_pass:
                     crop2, x_off2, y_off2 = crop_at(
-                        infer_frame,
-                        args.second_crop_ratio,
-                        args.second_crop_center_x,
-                        args.second_crop_center_y,
+                        infer_frame, args.second_crop_ratio,
+                        args.second_crop_center_x, args.second_crop_center_y,
                     )
                     raw_crop2 = m.detect(crop2, nms=args.nms, tol=args.confidence)
                     raw.extend(remap_detections(raw_crop2, x_off2, y_off2))
 
                 detections = filter_detections(
-                    raw,
-                    frame,
+                    raw, frame,
                     min_conf=args.min_conf,
                     max_area_ratio=args.max_area_ratio,
                     edge_margin_ratio=args.edge_margin_ratio,
@@ -282,12 +280,15 @@ def main():
 
                 count += 1
                 if count % 30 == 0:
-                    print(f"infer_frames={count} dets={len(detections)}")
+                    print(f"infer_frames={count} dets={len(detections)}", flush=True)
                 if detections:
-                    print(f"detections={len(detections)} first={detections[0]}")
+                    print(f"detections={len(detections)} first={detections[0]} count={count} time={time.monotonic()}", flush=True)
 
                 with det_lock:
                     latest_detections[0] = detections
+
+                if detections:
+                    print(f"[WRITE] seq={frame_seq[0]} dets={len(detections)} first={detections[0]}", flush=True)
 
         t_cap = threading.Thread(target=capture_thread, daemon=True)
         t_inf = threading.Thread(target=inference_thread, daemon=True)
@@ -297,61 +298,61 @@ def main():
         frame_interval = 1.0 / FPS
 
         try:
-            while not stop_event.is_set():
-                loop_start = time.monotonic()
+            if args.no_output:
+                # Capture + inference only — keep main thread alive, no writer work
+                while not stop_event.is_set():
+                    time.sleep(0.5)
+            else:
+                while not stop_event.is_set():
+                    loop_start = time.monotonic()
 
-                with frame_lock:
-                    frame = latest_frame[0]
-                if frame is None:
-                    time.sleep(0.005)
-                    continue
-
-                frame = frame.copy()
-
-                with det_lock:
-                    detections = latest_detections[0]
-
-                if args.overlay:
-                    for detection in detections:
-                        bbox = detection["bbox"]
-                        x_min, y_min = int(bbox[0][0]), int(bbox[0][1])
-                        x_max, y_max = int(bbox[1][0]), int(bbox[1][1])
-                        class_id = int(detection.get("id", -1))
-                        confidence = float(detection.get("confidence", 0.0))
-                        label = resolve_label(class_id, labels)
-
-                        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-                        text = f"{label} {confidence:.2f}"
-                        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                        cv2.rectangle(frame, (x_min, y_min - th - 6), (x_min + tw, y_min), (0, 255, 0), -1)
-                        cv2.putText(
-                            frame,
-                            text,
-                            (x_min, y_min - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 0, 0),
-                            1,
-                            cv2.LINE_AA,
-                        )
-
-                frame = cv2.resize(frame, (WIDTH, HEIGHT))
-                if not frame.flags["C_CONTIGUOUS"]:
+                    with frame_lock:
+                        frame = latest_frame[0]
+                    if frame is None:
+                        time.sleep(0.005)
+                        continue
                     frame = frame.copy()
 
-                writer.write(frame)
+                    with det_lock:
+                        detections = latest_detections[0]
 
-                elapsed = time.monotonic() - loop_start
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    if args.overlay:
+                        for detection in detections:
+                            bbox = detection["bbox"]
+                            x_min, y_min = int(bbox[0][0]), int(bbox[0][1])
+                            x_max, y_max = int(bbox[1][0]), int(bbox[1][1])
+                            class_id = int(detection.get("id", -1))
+                            confidence = float(detection.get("confidence", 0.0))
+                            label = resolve_label(class_id, labels)
+
+                            cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+                            text = f"{label} {confidence:.2f}"
+                            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                            cv2.rectangle(frame, (x_min, y_min - th - 6), (x_min + tw, y_min), (0, 255, 0), -1)
+                            cv2.putText(frame, text, (x_min, y_min - 4),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+                    if frame.shape[1] != WIDTH or frame.shape[0] != HEIGHT:
+                        frame = cv2.resize(frame, (WIDTH, HEIGHT))
+                    if not frame.flags["C_CONTIGUOUS"]:
+                        frame = frame.copy()
+
+                    writer.write(frame)
+
+                    elapsed = time.monotonic() - loop_start
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
 
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:
             stop_event.set()
+            t_cap.join(timeout=2.0)
+            t_inf.join(timeout=2.0)
             cap.release()
-            writer.release()
+            if writer is not None:
+                writer.release()
 
     else:
         frame_interval = 1.0 / FPS
@@ -366,7 +367,8 @@ def main():
                 frame = cv2.resize(frame, (WIDTH, HEIGHT))
                 if not frame.flags["C_CONTIGUOUS"]:
                     frame = frame.copy()
-                writer.write(frame)
+                if writer is not None:
+                    writer.write(frame)
 
                 elapsed = time.monotonic() - loop_start
                 sleep_time = frame_interval - elapsed
@@ -377,7 +379,8 @@ def main():
             print("\nStopping...")
         finally:
             cap.release()
-            writer.release()
+            if writer is not None:
+                writer.release()
 
 
 if __name__ == "__main__":
