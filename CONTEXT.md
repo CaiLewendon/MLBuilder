@@ -561,3 +561,123 @@ Interactive panel (without `--live-fire`): gimbal control + BLANK fire simulatio
 4. **Decide on live-inference output choke** (open from prior session): `--no-output` works for autonomous-only; H.264 encoded relay or two-machine split needed if laptop viewer is required.
 5. **Consider FOV calibration** for deadbeat tracking (still open from prior session).
 6. **Earth-frame stabilization** (still open).
+
+---
+
+## 2026-05-14 Late Addendum #2 (Fire path refactored: DO_REPEAT_RELAY + COMMAND_ACK-gated)
+
+After completing the DO_SET_RELAY ON+timer+OFF + RELAY_STATUS-gated state machine (the previous addendum) and confirming it worked, we refactored the fire path to use `DO_REPEAT_RELAY` (matching QGC's "Shoot Gun" command shape) with `COMMAND_ACK` as the confirmation source instead of `RELAY_STATUS`. The new path is simpler — autopilot owns the relay-pulse timing, the script just sends one command and tracks elapsed time.
+
+### Why we changed it
+- User requested: *"can we switch it to the do repeat relay with the same arming and disarming logic?"*
+- First attempt re-used `RELAY_STATUS` as the confirmation gate → **got stuck in ARMING forever**. `DO_REPEAT_RELAY(cycles=1)` toggles ON→OFF→back, so RELAY_STATUS reflects the *commanded final* state (which equals the initial state) and may never show intermediate ON.
+- User identified the right next step: *"we should also be able to check the ack command from do repeat relay to verify the states no?"* — yes, COMMAND_ACK fires within ~100ms of the autopilot accepting the command and is the reliable truth source for "did the autopilot get the command?".
+
+### Final architecture (4 phases)
+
+```
+IDLE ──[centered]──► ARMING ──[ACK result=0]──► FIRING ──[fire_period sec]──► COOLDOWN ──[2*fire_period + fire_cooldown sec total]──► IDLE
+                       │ │
+                       │ └─[ACK result≠0]──► IDLE (rejected — log error, no cooldown needed)
+                       │
+                       └─[1.0s timeout, no ACK]──► FIRING (assume command got through, ACK lost)
+```
+
+**Phase details:**
+
+| Phase | Entry action | Exit condition |
+|---|---|---|
+| IDLE | None | Target enters CENTERED → send ONE `DO_REPEAT_RELAY(relay=1, cycles=1, period=2*fire_period)`, record `fire_send_time = now`, → ARMING |
+| ARMING | (none) | (1) `COMMAND_ACK cmd=182 result=0` after `fire_send_time` → FIRING. (2) `COMMAND_ACK cmd=182 result≠0` after `fire_send_time` → IDLE (rejected). (3) `now - fire_send_time >= 1.0s` without matching ACK → FIRING (timeout-assumed) |
+| FIRING | (none) | `now - fire_send_time >= fire_period` → COOLDOWN |
+| COOLDOWN | (none) | `now - fire_send_time >= 2*fire_period + fire_cooldown` → IDLE |
+
+**MAVLink traffic per fire cycle:**
+- Outbound: 1× `DO_REPEAT_RELAY` (one packet). That's it.
+- Inbound: 1× `COMMAND_ACK` cmd=182. Plus the always-on inbound `RELAY_STATUS` at 5 Hz (autopilot publishes; we just listen for log visibility).
+- **No keepalive. No reassertion. No periodic OFF commands.** Minimum possible command rate.
+
+### GimbalLink additions for this iteration
+
+```python
+class GimbalLink:
+    # ... existing ...
+    self._last_repeat_relay_ack_result = None  # int, e.g. 0=ACCEPTED, 2=DENIED, 4=FAILED, 5=UNSUPPORTED
+    self._last_repeat_relay_ack_time = None    # time.monotonic() when ACK was captured
+
+    def get_last_repeat_relay_ack(self) -> tuple:
+        """Returns (result, monotonic_timestamp_or_None)."""
+        with self._lock:
+            return self._last_repeat_relay_ack_result, self._last_repeat_relay_ack_time
+```
+
+`run_rx_loop` now captures the ACK when handling `COMMAND_ACK` for `cmd=182`:
+```python
+if cmd == MAV_CMD_DO_REPEAT_RELAY:
+    with self._lock:
+        self._last_repeat_relay_ack_result = int(msg.result)
+        self._last_repeat_relay_ack_time = time.monotonic()
+```
+
+### What was REMOVED from the previous iteration
+- `ARMING` and `DISARMING` phases gated on `RELAY_STATUS` (replaced by single ACK-gated ARMING; DISARMING no longer needed since autopilot auto-OFFs after the cycle's ON half).
+- 2 Hz `DO_SET_RELAY` keepalive in every phase (replaced by zero keepalive — autopilot owns timing).
+- `fire_state["last_send"]`, `fire_state["lock_fired"]` (no longer needed with the simpler timer model).
+- `fire_state["phase_start_time"]` (replaced by `fire_send_time` which serves all phase timing).
+
+### What was KEPT from the previous iteration
+- `RELAY_STATUS` subscription at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) on connect. Still useful for visibility.
+- `--live-fire`, `--no-fire`, `--fire-relay`, `--fire-period`, `--fire-cooldown` CLI flags (semantics preserved).
+- BLANK mode auto-confirmation (now 0.1 s simulated ACK).
+- Exit safety `DO_SET_RELAY OFF` in `finally` block (interrupts in-progress cycle on Ctrl-C / crash).
+- `run_rx_loop` printing `[ACK-RELAY] cmd=182 result=N (0=ACCEPTED, ...)` lines.
+
+### CLI flag semantics
+
+- `--fire-period 5.0` (default) — user-facing "ON time" in seconds. Script sends `param3 = 2 * fire_period = 10.0` so ArduPilot's cycle-half is 5s.
+- `--fire-cooldown 0.5` (default) — ADDITIONAL idle after the autopilot's full cycle (2*fire_period) completes, before next fire is allowed. So total time between fires = `2 * fire_period + fire_cooldown = 10.5s` with defaults.
+- `--fire-relay 1` (default) — matches QGC "Shoot Gun" action's `param1=1`.
+- `--live-fire` — actually send `DO_REPEAT_RELAY`. Without it, BLANK mode logs phase transitions only.
+- `--no-fire` — disables fire logic entirely.
+
+### Per-frame log signature
+
+Successful cycle:
+```
+[F0001] ... dir=CENTERED ... fire_phase=IDLE ...
+[LIVE ARMING] sent DO_REPEAT_RELAY(1,cycles=1,period=10.00s); awaiting COMMAND_ACK for cmd=182
+[F0002] ... fire_phase=ARMING ...
+[ACK-RELAY] cmd=182 result=0 (0=ACCEPTED, 4=FAILED, 2=DENIED, 5=UNSUPPORTED)
+[LIVE ARMED] COMMAND_ACK result=0 (ACCEPTED) after 0.18s; autopilot will pulse relay ON for ~5.00s
+[F0003] ... FIRING_LIVE_t=0.21s ...
+[F0050] ... FIRING_LIVE_t=4.95s ...
+[LIVE BURST DONE] 5.00s ON elapsed; RELAY[1]=OFF; awaiting cycle completion + 0.50s cooldown
+[F0051] ... fire_phase=COOLDOWN ...
+[LIVE FIRE READY] cycle (10.00s) + cooldown (0.50s) complete; RELAY[1]=?; re-armed
+```
+
+Rejected ACK:
+```
+[LIVE ARMING] sent DO_REPEAT_RELAY(1,cycles=1,period=10.00s); awaiting COMMAND_ACK for cmd=182
+[ACK-RELAY] cmd=182 result=4 ...
+[LIVE ARMING REJECTED] COMMAND_ACK result=4 (2=DENIED, 4=FAILED, 5=UNSUPPORTED) after 0.18s; NOT firing; back to IDLE
+```
+
+Timeout (no ACK):
+```
+[LIVE ARMING] sent DO_REPEAT_RELAY(1,cycles=1,period=10.00s); awaiting COMMAND_ACK for cmd=182
+[LIVE ARMED WARN] no COMMAND_ACK in 1.00s; assuming command got through (ACK may have been lost). If no fire occurred, autopilot may have rejected silently.
+```
+
+### Status: NEEDS PI RE-VALIDATION
+
+The previous iteration (DO_SET_RELAY + RELAY_STATUS-gated) was user-validated working. This refactor to DO_REPEAT_RELAY + COMMAND_ACK-gated has been compile-tested only. **The next Pi run should confirm it works end-to-end before this is called "final".**
+
+Quickest validation: pass `--live-fire` and watch for the `[ACK-RELAY] cmd=182 result=0` line. If you see it, the cycle is running and the rest of the state machine is timer-driven so will progress.
+
+### Next session priorities (updated)
+1. **Pi re-validation of the ACK-gated fire path** — confirm `[ACK-RELAY] cmd=182 result=0` arrives and the cycle behaves as expected. If it doesn't, the DO_SET_RELAY version is in git history (one commit back).
+2. Tune `fire_period` / `fire_cooldown` for mission.
+3. Tune slew rates.
+4. Field test on airframe.
+5-7. (other open items from previous addendum unchanged).

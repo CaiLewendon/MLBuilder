@@ -1,37 +1,43 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-14 late — autonomous tracking + state-machine firing, both USER-VALIDATED)
+## ⏸ WHERE WE LEFT OFF (2026-05-14 late — autonomous tracking + ACK-gated DO_REPEAT_RELAY firing)
 
-**Two big subsystems converged this session, both confirmed working end-to-end on the Pi against the autopilot:**
+**Two subsystems live in `test/tf_live_inferenceV2_gimbal_auto.py`. Tracking has been user-validated end-to-end. Fire path was just refactored from the DO_SET_RELAY ON/OFF + RELAY_STATUS-gated design (user-validated earlier in the session) to a simpler DO_REPEAT_RELAY + COMMAND_ACK-gated design — needs a Pi test to re-validate before being called "final".**
 
-### 1. Gimbal control law — slew-rate-limited proportional (final architecture)
+### 1. Gimbal control law — slew-rate-limited proportional (USER-VALIDATED, final)
 The integrator runaway diagnosed earlier in the day was fixed by **decoupling the controller from the transmitted setpoint via `GimbalLink`**:
 - Inference thread computes `wished_yaw = link.get_current() + yaw_gain * err_x` **fresh every frame** (NOT integrated). The reference is the actual transmitted position, not a free-running counter.
 - TX thread (20 Hz) ramps `current_yaw` toward `wished_yaw` by at most `max_slew_rate_yaw / 20` degrees per tick. Hard rate-limit. Gimbal can never be commanded faster than its physical slew can keep up with.
 - Per-frame log carries both `cur=(y,p)` (transmitted, what gimbal sees) and `wished=(y,p)` (controller intent, leads by `gain * err`).
 - Defaults: `--yaw-gain 12`, `--pitch-gain 10` (sim values, unchanged), `--max-slew-rate-yaw 2.0`, `--max-slew-rate-pitch 1.5` (deg/sec).
-- New `--start-from-current` flag: reads `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` via `read_current_gimbal_position()` and starts the controller from the gimbal's actual orientation. Without the flag, the script centers the gimbal first.
+- New `--start-from-current` flag: reads `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` via `read_current_gimbal_position()` and starts the controller from the gimbal's actual orientation. Without the flag, the script centers the gimbal first. **Confirmed working** — user's gimbal reported `pitch=+37.71 yaw=+1.13` and tracking continued smoothly from that reference.
 
-### 2. Fire control — phase state machine driven by RELAY_STATUS confirmation (final architecture)
-After iterating through many false starts (DO_REPEAT_RELAY with double-send, DO_SET_RELAY ON+timer+OFF, idle heartbeats, blind keepalive), we landed on:
-- **Five-phase state machine**: `IDLE → ARMING → FIRING → DISARMING → COOLDOWN → IDLE`.
-- **No phase advance without `RELAY_STATUS` confirmation** for ARMING→FIRING (waits for bit=1) and DISARMING→COOLDOWN (waits for bit=0). FIRING→DISARMING and COOLDOWN→IDLE are time-based.
-- **2 Hz keepalive** in every phase sends `DO_SET_RELAY` with the desired state. Idempotent. Single-packet loss can't strand the relay in the wrong state for more than ~500 ms.
-- **`RELAY_STATUS` (msg 376)** subscribed at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) at MAVLink connect. ArduPilot's relay bits are 0-indexed; gun is relay **1** (matches QGC "Shoot Gun" action's `param1=1`).
-- **`fire_period` timer starts on confirmed ON** (not on send), so 5 s burst is exactly 5 s ON from autopilot's perspective. Same for `fire_cooldown` after confirmed OFF.
-- BLANK mode (`--live-fire` absent) auto-confirms phase transitions after 100 ms simulated lag for testing.
+### 2. Fire control — DO_REPEAT_RELAY + COMMAND_ACK-gated state machine (CURRENT — needs Pi re-test)
+After validating the DO_SET_RELAY ON+timer+OFF + RELAY_STATUS-gated design with the user, we refactored to use `DO_REPEAT_RELAY` (mirroring the QGC "Shoot Gun" command shape) with `COMMAND_ACK` as the gate instead of `RELAY_STATUS`.
+- **4-phase state machine**: `IDLE → ARMING → FIRING → COOLDOWN → IDLE`.
+- **IDLE→ARMING**: send ONE `DO_REPEAT_RELAY(relay=1, cycles=1, period=2*fire_period)` and mark `fire_send_time`. ArduPilot's cycle does `period/2` seconds ON then `period/2` seconds OFF; with `period = 2*fire_period`, the ON-half equals `fire_period`.
+- **ARMING→FIRING**: gated on `COMMAND_ACK` for cmd=182 received AFTER `fire_send_time`.
+  - `result=0` (ACCEPTED) → FIRING (autopilot confirmed it's running the cycle)
+  - `result≠0` (DENIED/FAILED/UNSUPPORTED) → IDLE, log error, NO cycle was started so no cooldown needed
+  - Timeout 1.0 s with no ACK → FIRING with WARN log (assume ACK was lost; honor the cycle timing in COOLDOWN)
+- **FIRING→COOLDOWN**: timer-based at `now - fire_send_time >= fire_period`. Autopilot owns the actual relay timing.
+- **COOLDOWN→IDLE**: timer-based at `now - fire_send_time >= 2*fire_period + fire_cooldown`. Waits for full autopilot cycle + cooldown gap so the next DO_REPEAT_RELAY can't collide with an in-progress one.
+- **`RELAY_STATUS` (msg 376)** is subscribed at 5 Hz via `SET_MESSAGE_INTERVAL` and read for log visibility (`RELAY[1]=ON/OFF/?` in burst-done logs) but **does NOT gate transitions** — ArduPilot's RELAY_STATUS may not show intermediate ON during a 1-cycle DO_REPEAT_RELAY (ends where it started), which is why RELAY_STATUS-gating got us stuck in ARMING with this command.
+- **Exactly ONE `DO_REPEAT_RELAY` per fire cycle**. No keepalive, no reassertion. Zero command spam. The `COMMAND_ACK` is inbound from autopilot.
+- BLANK mode (`--live-fire` absent) auto-confirms ARMING after 0.1 s simulated lag.
 
 ### Key learnings from the long debugging arc (don't repeat)
-- **`MAV_CMD_DO_REPEAT_RELAY` (182) with `cycles=1, period=N`** does **N/2 seconds ON, N/2 seconds OFF** in ArduPilot. NOT "ON for N seconds". `period=5` gave us 2.5 s ON — wrong tool for "fire for X seconds" requirements.
+- **`MAV_CMD_DO_REPEAT_RELAY` (182) with `cycles=1, period=N`** does **N/2 seconds ON, N/2 seconds OFF** in ArduPilot. So `--fire-period 5` requires `param3 = 2*fire_period = 10`. NOT "ON for N seconds" directly — the script computes the cycle_time internally.
 - **Double-sending `DO_REPEAT_RELAY` (50 ms apart)** caused on/off/on/off chatter — each command starts its own relay-pulse state machine in the autopilot, and concurrent state machines collide. **Single-send only** for that command.
-- **Sending `DO_SET_RELAY` OFF while a `DO_REPEAT_RELAY` cycle is in progress** interrupts the cycle. Mixing these commands is brittle. Pick one mechanism and stick with it.
-- The right primitive for "script controls the on-time" is **`DO_SET_RELAY` (181) ON, wait, `DO_SET_RELAY` OFF**. The autopilot just holds state; the script owns timing.
-- **QGroundControl's "Shoot Gun" action** is `cmd=182 param1=1 param2=1 param3=2` — relay 1, 1 cycle of 2 s = 1 s pulse. Verified by user.
-- **The user's autopilot publishes `RELAY_STATUS`** and our `SET_MESSAGE_INTERVAL` request works — confirmed at runtime.
+- **Sending `DO_SET_RELAY` OFF while a `DO_REPEAT_RELAY` cycle is in progress** interrupts the cycle. Mixing commands is brittle UNLESS the interrupt is intentional (abort / safety / exit cleanup).
+- **`RELAY_STATUS` is unreliable for gating DO_REPEAT_RELAY phase transitions** because it reports the commanded *final* state, and a 1-cycle DO_REPEAT_RELAY ends where it started. **Use `COMMAND_ACK` instead** — it confirms the autopilot accepted the command within ~100 ms regardless of relay timing.
+- **The right primitive choice**: `DO_SET_RELAY` (181) when the SCRIPT owns the on-time and you want fine control + intermediate state visibility. `DO_REPEAT_RELAY` (182) when the AUTOPILOT owns the on-time and you want to mirror a QGC button exactly. Pick one and stick with it.
+- **QGroundControl's "Shoot Gun" action** is `cmd=182 param1=1 param2=1 param3=2` — relay 1, 1 cycle of 2 s = 1 s pulse. Verified by user. Our autonomous script sends the same command shape but with `param3 = 2*fire_period`.
+- **The user's autopilot publishes `RELAY_STATUS`** AND ACKs `cmd=182` correctly — both confirmed at runtime.
 
 ### Working artifacts on disk
-- `test/tf_live_inferenceV2_gimbal_auto.py` — autonomous tracking + state-machine firing (FINAL — user-confirmed working).
-- `test/manual_gimbal_control.py` — `--live-fire` is now a one-shot fire-and-exit (parallel to `--center-gimbal`). Press `f` in panel mode for BLANK simulation; pass `--live-fire` as a CLI arg for real one-shot fire. Used as the isolation harness that confirmed the autopilot's relay control.
+- `test/tf_live_inferenceV2_gimbal_auto.py` — autonomous tracking (validated) + ACK-gated DO_REPEAT_RELAY firing (needs Pi re-test).
+- `test/manual_gimbal_control.py` — `--live-fire` is a one-shot fire-and-exit (parallel to `--center-gimbal`). Press `f` in panel mode for BLANK simulation; pass `--live-fire` as a CLI arg for real one-shot fire. Used as the isolation harness that confirmed the autopilot's relay control.
 
 ### Pi commands (current production)
 ```bash

@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-14 23:02:51 PDT
+Generated: 2026-05-14 23:58:13 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,10 +21,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                0cadeec95f8887d4d9a450a1bf555a8f7f1b21af Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
+* cPCcputestinglocally                ca5f44485a555198f4715e6c2ab722fe8029cc86 I got hte gimbal autonomy finished
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally 0cadeec95f8887d4d9a450a1bf555a8f7f1b21af Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
+  remotes/origin/cPCcputestinglocally ca5f44485a555198f4715e6c2ab722fe8029cc86 I got hte gimbal autonomy finished
   remotes/origin/cTPUtest             714f8c78346f8d84aa6cb8d9d252e1a034af4e24 divyesh is financially iliterate
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
@@ -38,7 +38,6 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
  M CODEX/AILEARN_REPORT.md
  M CONTEXT.md
  M KANBAN.md
- M test/manual_gimbal_control.py
  M test/tf_live_inferenceV2_gimbal_auto.py
 
 ```
@@ -126041,5 +126040,6 @@ ef719ce | 2026-05-02 |  | it works hell yea
 2bb74a2 | 2026-05-10 |  | added mavlink test suite script
 1105e25 | 2026-05-10 |  | updated test suite
 1fdd0c2 | 2026-05-12 |  | documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
-0cadeec | 2026-05-14 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
+0cadeec | 2026-05-14 |  | Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
+ca5f444 | 2026-05-14 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | I got hte gimbal autonomy finished
 ```

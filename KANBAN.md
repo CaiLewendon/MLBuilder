@@ -1,5 +1,44 @@
 # Kanban
 
+## Done (2026-05-14 late #2 — fire path refactored: DO_REPEAT_RELAY + COMMAND_ACK-gated; NEEDS PI RE-VALIDATION)
+
+After the DO_SET_RELAY + RELAY_STATUS-gated state machine was user-validated working, refactored the fire path on user request to use `DO_REPEAT_RELAY` (mirroring QGC's "Shoot Gun" exactly) with `COMMAND_ACK` as the confirmation source instead of `RELAY_STATUS`.
+
+### Why the switch
+- User: *"can we switch it to the do repeat relay with the same arming and disarming logic?"*
+- First try used `RELAY_STATUS` to gate ARMING — script got stuck in ARMING because ArduPilot's `RELAY_STATUS` doesn't reliably show intermediate ON during a 1-cycle `DO_REPEAT_RELAY` (cycle ends where it started, so commanded final state = initial state).
+- User identified the fix: *"we should also be able to check the ack command from do repeat relay to verify the states no?"*
+- `COMMAND_ACK` for `cmd=182` arrives within ~100ms regardless of relay timing → reliable gate.
+
+### Final architecture (4-phase, ACK-gated)
+- `IDLE → ARMING → FIRING → COOLDOWN → IDLE`
+- IDLE→ARMING: send ONE `DO_REPEAT_RELAY(relay=1, cycles=1, period=2*fire_period)`, mark `fire_send_time`.
+- ARMING→FIRING: `COMMAND_ACK cmd=182 result=0` received after `fire_send_time` (or 1.0 s timeout → log warning, proceed).
+- ARMING→IDLE: `COMMAND_ACK cmd=182 result≠0` (rejected — no cycle was started, no cooldown needed).
+- FIRING→COOLDOWN: `now - fire_send_time >= fire_period` (timer).
+- COOLDOWN→IDLE: `now - fire_send_time >= 2*fire_period + fire_cooldown` (full autopilot cycle + idle gap).
+- BLANK mode (without `--live-fire`) auto-confirms ARMING after 0.1 s simulated lag.
+
+### MAVLink traffic per fire
+- Outbound: 1× `DO_REPEAT_RELAY`. ZERO keepalive, zero reassertion.
+- Inbound: 1× `COMMAND_ACK`. Plus the always-on `RELAY_STATUS` at 5 Hz (visibility only).
+
+### Implementation changes
+- New: `GimbalLink._last_repeat_relay_ack_result`, `_last_repeat_relay_ack_time`.
+- New: `GimbalLink.get_last_repeat_relay_ack() → (result, timestamp_or_None)`.
+- `run_rx_loop` now captures the ACK for `cmd=182` (already logs it; now stores it).
+- `fire_advance(centered)` rewritten as 4-phase machine. Removed `fire_state["last_send"]`, `lock_fired`, `phase_start_time` (replaced by `fire_send_time` which serves all phase timing).
+- CLI flag help text updated for `DO_REPEAT_RELAY` semantics (`fire_period` is the ON-half of a `2*fire_period` cycle; `fire_cooldown` is additional idle AFTER the full cycle completes; total between fires = `2*fire_period + fire_cooldown`).
+
+### Status: NEEDS PI RE-VALIDATION
+The previous iteration (DO_SET_RELAY-based) was user-validated. This refactor is compile-clean but Pi-untested. Next Pi run should watch for `[ACK-RELAY] cmd=182 result=0` to confirm the autopilot accepted the command. If `result≠0` or timeout occurs frequently, fall back to the DO_SET_RELAY version (one git commit back) which was confirmed working.
+
+### Things removed in this iteration (preserved in git history if needed)
+- 2 Hz `DO_SET_RELAY` keepalive in every phase.
+- `RELAY_STATUS`-bit confirmation for ARMING/DISARMING transitions.
+- `DISARMING` phase (no longer needed — autopilot auto-OFFs after cycle ON-half).
+- `lock_fired` flag (timer-based COOLDOWN serves the same gate).
+
 ## Done (2026-05-14 late — slew-rate-limited tracking + state-machine firing, USER-VALIDATED on real hardware)
 
 ### Gimbal control law (final architecture — replaces the cumulative-P integrator)
