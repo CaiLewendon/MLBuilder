@@ -681,3 +681,191 @@ Quickest validation: pass `--live-fire` and watch for the `[ACK-RELAY] cmd=182 r
 3. Tune slew rates.
 4. Field test on airframe.
 5-7. (other open items from previous addendum unchanged).
+
+---
+
+## 2026-05-15 Late Addendum #3 (Autonomous drone-movement script — built, not yet flown)
+
+New artifact: `test/tf_live_inferenceV2_drone_auto.py` (1727 lines). Mirror-of-gimbal_auto for autonomous drone POSITIONING in GUIDED mode.
+
+### Scope
+- Inputs: live RTSP camera feed → TFLite detections → drone-positioning state machine.
+- Outputs: `SET_POSITION_TARGET_LOCAL_NED` (msg 84) velocity setpoints in body frame at `--tx-rate` Hz (default 10 Hz).
+- Modes: BLANK (default — logs what it would send), `--live-fly` (real sends), `--no-mavlink` (pure dry-run with simulated LiDAR).
+- Does NOT control the gimbal or fire — those live in `tf_live_inferenceV2_gimbal_auto.py`. The two scripts can run as separate processes.
+
+### Plan-mode decisions (user-answered)
+1. **Gimbal scope** — drone-movement only, gimbal handled separately. (Option: "Drone movement only, gimbal handled separately".)
+2. **Distance source** — Real `DISTANCE_SENSOR` (msg 132). Subscribed at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) at connect. Fail-fast if not received within `--distance-sensor-timeout` (default 5 s) unless `--simulate-distance` is set.
+3. **Send-mode flag name** — `--live-fly` (off by default = BLANK, log only). Mirrors `--live-fire` naming from gimbal_auto.
+
+### Architecture
+4 daemon threads:
+- `capture_thread` — RTSP `pipeline3` → `latest_frame` slot (drop-old, single-slot)
+- `inference_thread` — TFLite model + `filter_detections` + 7-state machine + `link.set_velocity(vx, vy=0, vz, yaw_rate_dps)`. Manages simulated LiDAR dynamics when `--simulate-distance`. Publishes overlay state for the main thread.
+- `drone_tx_thread` — `MovementLink.run_tx_loop` continuous sender at `--tx-rate` Hz. BLANK mode logs `[BLANK SEND]` at 1 Hz instead of transmitting.
+- `drone_rx_thread` — `MovementLink.run_rx_loop` captures HEARTBEAT / DISTANCE_SENSOR / VFR_HUD / LOCAL_POSITION_NED / COMMAND_ACK / STATUSTEXT.
+- Main thread — optional video writer (`pipeline4` UDP H.264), full OSD overlay. `--no-output` skips.
+
+### `MovementLink` class
+
+Lock-protected state mirrors `GimbalLink`:
+```
+_vx, _vy, _vz, _yaw_rate_rad   : current velocity setpoint (inference writes, tx reads)
+_last_heartbeat                : (flightmode_str, base_mode, custom_mode, sys_status, mono_time)
+_last_distance_cm              : (cm, mono_time)
+_last_vfr_hud                  : (groundspeed, airspeed, climb, alt, heading, mono_time)
+_last_local_position           : (x, y, z, vx, vy, vz, mono_time)
+_last_command_ack              : (cmd, result, mono_time)
+```
+
+Methods:
+- `set_velocity(vx, vy, vz, yaw_rate_dps)` — converts deg/s to rad/s at boundary
+- `get_velocity()`, `get_velocity_raw()`, `get_mode()`, `is_guided()`, `get_distance_cm()`, `get_vfr_hud()`, `get_local_position()` — all return `(value, age_seconds_or_None)` pattern
+- `run_tx_loop(stop_event)` — continuous send at `send_interval = 1/tx_rate_hz`
+- `run_rx_loop(stop_event)` — drains inbox, captures relevant messages
+- `send_halt()` — single zero-velocity send for exit safety
+- `_transmit(vx, vy, vz, yaw_rate_rad)` — internal; returns True if sent, False if BLANK or suppressed (not GUIDED). Logs `[MODE LOST]` rate-limited to once per 2 s.
+
+### 7-state machine (ported VERBATIM from drone_simulation:15-21, 91-105, 611-770)
+
+| State | Trigger to enter | Outputs (m/s, deg/s) | Trigger to exit |
+|---|---|---|---|
+| `NO_TARGET` | `selected is None AND !locked_on_target` | all zeros | target seen + min_track_confidence passed |
+| `CENTERING` | target seen, not yaw-aligned | `yaw_rate = clamp(yaw_gain*err_x, ±max_yaw_rate)` | `|err_x| <= deadband` |
+| `APPROACH` | yaw-aligned, outside `target_distance_cm ± distance_tolerance_cm` | `vx = distance_vx_command(...)` | enters distance window |
+| `HOLD` | yaw-aligned, inside distance window | trim with `hold_forward_gain` if outside `distance_center_band_cm`; `hold_confirm_count++` | `hold_confirm_count >= lock_confirm_frames` → LOCKED_HOLD |
+| `LOCKED_HOLD` | hold confirmation reached | tight `deadband*lock_deadband_scale`, `lock_yaw_gain`, `lock_forward_gain` | sub-state of: |
+| `ALTITUDE_ADJUST` | locked, not yet final_hold | `vz = clamp(-altitude_gain*alt_error_norm, ±max_vz)`; `altitude_confirm_count++` when in altitude deadband | `altitude_confirm_count >= altitude_lock_confirm_frames` → FINAL_HOLD |
+| `FINAL_HOLD` | altitude confirmed | all three axes active with disturbance rejection | persistent unless target loss |
+
+Sticky altitude target after lock: `sim_target_cy` is captured at lock-engage and used as `control_cy` thereafter, preventing the altitude loop from chasing a drifting target.
+
+### MAVLink wire format
+
+**Command**: `SET_POSITION_TARGET_LOCAL_NED` (msg 84, NOT a `command_long`)
+- `coordinate_frame = MAV_FRAME_BODY_NED = 8` (body: +x=forward, +y=right, +z=down)
+- `type_mask = 0x7C7` (set bits IGNORE):
+  - 0x001 pos_x, 0x002 pos_y, 0x004 pos_z (IGNORE)
+  - 0x008 vel_x, 0x010 vel_y, 0x020 vel_z (KEEP — clear)
+  - 0x040 acc_x, 0x080 acc_y, 0x100 acc_z, 0x200 force (IGNORE)
+  - 0x400 yaw (IGNORE)
+  - 0x800 yaw_rate (KEEP — clear)
+- `vx, vy, vz` in m/s
+- `yaw_rate` in **rad/s** (script converts from sim's deg/s at the transmit boundary)
+- No COMMAND_ACK for this message — it's a setpoint, not a command.
+
+**ACK-able commands sent on connect**:
+- `MAV_CMD_SET_MESSAGE_INTERVAL` (511) for HEARTBEAT/DISTANCE_SENSOR/LOCAL_POSITION_NED/VFR_HUD. `run_rx_loop` captures the ACK and logs `[ACK] SET_MESSAGE_INTERVAL result=N`.
+
+**Continuous transmission required**: ArduPilot times out velocity setpoints if not received at ≥4 Hz. `--tx-rate` default 10 Hz; arg validator rejects values < 4.
+
+### Startup GUIDED gate
+
+After `wait_heartbeat()`:
+```python
+mode = getattr(master, "flightmode", None)
+if mode != "GUIDED":
+    print("[GUIDED CHECK FAILED] Autopilot is in flightmode={mode}. "
+          "Switch to GUIDED via QGC/transmitter then re-run.")
+    sys.exit(4)
+```
+
+No `MAV_CMD_DO_SET_MODE` sent — explicitly per user instruction. Can be bypassed with `--no-guided-check` for ground bench testing.
+
+### Mode monitoring during operation
+
+`run_rx_loop` parses every HEARTBEAT, updates `_last_heartbeat`. On mode-string change, prints `[MODE CHANGE] OLD -> NEW`. TX loop checks `link.is_guided()` before each send; if False (or HEARTBEAT stale > 3 s), suppresses send and logs `[MODE LOST]` rate-limited to once per 2 s.
+
+### Exit safety
+
+`finally` block in main:
+1. `stop_event.set()`
+2. **If `--live-fly` and master is not None**: `link.send_halt()` — single zero-velocity SET_POSITION_TARGET_LOCAL_NED.
+3. Thread joins with 2 s timeout
+4. `cap.release()`, `writer.release()`, `master.close()`
+
+### CLI args
+
+All of gimbal_auto's inference/preprocessing args (`--tpu`, `--process`, `--no-output`, `--confidence`, `--min-conf`, `--max-area-ratio`, `--edge-margin-ratio`, `--center-crop-pass`, `--crop-center-*`, `--second-crop-*`, `--clahe`, etc.) plus all of drone_simulation's control args (`--deadband 0.08`, `--yaw-gain 35.0`, `--max-yaw-rate 25.0`, `--forward-gain 0.80`, `--max-vx 0.55`, `--target-distance-cm 200.0`, `--distance-tolerance-cm 15.0`, `--hold-forward-gain 0.35`, `--lock-yaw-gain 45.0`, `--lock-forward-gain 1.00`, `--altitude-target-y-ratio 0.75`, `--altitude-gain 0.55`, `--max-vz 0.35`, `--altitude-deadband 0.04`, `--lock-confirm-frames 8`, `--altitude-lock-confirm-frames 8`, `--min-track-confidence 0.35`, etc.) plus simulated-LiDAR args (used only with `--simulate-distance`).
+
+New flags:
+| Flag | Default | Notes |
+|---|---|---|
+| `--live-fly` | off | DANGEROUS. Real sends. Without it: BLANK mode logs only. |
+| `--no-guided-check` | off | Bypass startup mode check (ground testing only). |
+| `--tx-rate` | 10.0 (Hz) | Must be ≥4 (ArduPilot setpoint timeout). |
+| `--simulate-distance` | off | Use simulated LiDAR (auto-enabled by `--no-mavlink`). |
+| `--distance-sensor-timeout` | 5.0 (s) | Fail-fast if no DISTANCE_SENSOR seen in this window. |
+
+### Per-frame log signature
+
+```
+[F000123] target_bbox=((735,330),(1155,780)) center=(945,555) err=(-0.016,+0.028)
+  conf=0.918 state=APPROACH action=FORWARD mode=GUIDED tx=BLANK
+  lidar=247.3cm(sensor)/FAR dist_err=+47.3cm
+  lock=OFF hold=0/8 alt=0/8 final_hold=OFF yaw_to_center=-0.62deg
+  CMD vx=+0.378m/s vz=+0.000m/s yaw_rate=+0.00deg/s
+  actual_vx=0.34m/s actual_vz=+0.02m/s
+```
+- `tx=BLANK` / `tx=LIVE` indicator
+- `mode=GUIDED` / `STABILIZE` / `LOITER` etc. from `master.flightmode`
+- `lidar=...cm(sensor|stale|sim)` — source tag
+- `actual_vx` / `actual_vz` from VFR_HUD if telemetry is fresh
+
+### OSD overlay (when `--overlay`)
+
+Ported wholesale from drone_simulation:
+- Center axis crosshair + label
+- Target circle + yaw vector (cyan arrow)
+- Altitude goal line (across full frame) + altitude vector (orange arrow) + ALT TARGET / ALT GOAL LINE labels
+- Status text block: `state= action= disp= err=`
+- Lidar/cmd line: `lidar={cm}({source}) ({dist_status}) target={tgt}+-{tol} dist_err={err} cmd[yaw_rate,vx,vz]=...`
+- Lock-state line: `lock= hold_frames= alt_frames= final_hold= lock_age= disturb=`
+- **New**: `mode=GUIDED` (red if not guided) + `tx=LIVE-FLY` / `tx=BLANK` indicator
+- **New**: `feedback: gs=... vz_body=...` from VFR_HUD next to commanded cmd
+- Yaw analysis, vector analysis, target-offset reference, detection count, frame counter
+
+### Status
+
+| Check | Status |
+|---|---|
+| Compile (`python3 -m py_compile`) | ✅ PASS |
+| `--help` exposes all flags | ✅ PASS |
+| `--live-fly + --no-mavlink` conflict caught | ✅ PASS (exit 6) |
+| `--tx-rate < 4.0` rejected | ✅ PASS |
+| Without `--process` → exit 2 | ✅ PASS (matches gimbal_auto) |
+| Pi BLANK-mode test | ❌ NOT YET DONE |
+| `--live-fly` flight test | ❌ NOT YET DONE |
+
+### Next-session priorities (full list)
+
+1. **Pi BLANK-mode test of drone_auto** (autopilot connected, drone DISARMED):
+   ```bash
+   python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+     --tpu -p --no-output --mavlink tcp:10.42.0.1:5760
+   ```
+   Verify: `[GUIDED CHECK]` passes (user must switch to GUIDED manually). `[BLANK SEND]` lines at 1 Hz. DISTANCE_SENSOR streaming with real cm values. State machine progressing through NO_TARGET → CENTERING → APPROACH → HOLD when a target enters frame.
+
+2. **Mode-loss recovery test**: with the BLANK-mode script running, switch out of GUIDED on the transmitter. Script should log `[MODE LOST]` and stop emitting `[BLANK SEND]` lines within ~250 ms (one HEARTBEAT period at 4 Hz). Switch back to GUIDED, sends resume.
+
+3. **Conservative `--live-fly` hover test** with observer on RC override:
+   ```bash
+   python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+     --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --live-fly \
+     --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \
+     --target-distance-cm 300 --distance-tolerance-cm 30
+   ```
+   Verify: drone yaws to center → approaches to 300 ±30 cm → descends so target lands in bottom quarter → holds. Confirm exit-on-Ctrl-C sends final (0,0,0,0) velocity and drone halts.
+
+4. **Pi RE-VALIDATION of the gimbal fire path** (still pending from prior session). DO_REPEAT_RELAY + COMMAND_ACK-gated state machine. Watch for `[ACK-RELAY] cmd=182 result=0`. If it doesn't arrive, fall back to the DO_SET_RELAY ON/OFF version (one git commit earlier — that was user-validated working).
+
+5. Tune `fire_period` / `fire_cooldown` / `max-vx` / `max-vz` / slew rates for mission requirements.
+
+6. Field test combined: drone_auto + gimbal_auto running as two processes against the same airframe.
+
+7. Open items from earlier sessions (still relevant):
+   - FOV-aware control mapping for the gimbal (HFOV/VFOV not captured)
+   - Gimbal closed-loop feedback (commanded vs MOUNT_STATUS / GIMBAL_DEVICE_ATTITUDE_STATUS)
+   - Earth-frame stabilization
+   - Live-inference output choke (open since 2026-05-13 evening)

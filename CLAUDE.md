@@ -1,6 +1,43 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-14 late — autonomous tracking + ACK-gated DO_REPEAT_RELAY firing)
+## ⏸ WHERE WE LEFT OFF (2026-05-15 — drone movement script built; NEEDS Pi BLANK-mode + flight test)
+
+**New artifact this session:** `test/tf_live_inferenceV2_drone_auto.py` (1727 lines). Production drone-positioning script that issues real MAVLink `SET_POSITION_TARGET_LOCAL_NED` velocity setpoints in body frame to an ArduPilot Copter in GUIDED mode. Combines:
+- 4-thread architecture from `tf_live_inferenceV2_gimbal_auto.py` (capture / inference / drone_tx / drone_rx)
+- 7-state control machine from `tf_live_infrence_drone_simulation.py` (NO_TARGET → CENTERING → APPROACH → HOLD → LOCKED_HOLD → ALTITUDE_ADJUST → FINAL_HOLD) — ported VERBATIM with same gains, deadbands, confirmation-frame logic, sticky altitude target after lock
+- New `MovementLink` class mirroring `GimbalLink` pattern: lock-protected state, run_tx_loop/run_rx_loop, but commands `SET_POSITION_TARGET_LOCAL_NED` (msg 84) instead of `DO_MOUNT_CONTROL`
+- `--live-fly` flag (DEFAULT OFF = BLANK mode logs what it would send; on = real sends)
+- Startup GUIDED-mode gate via `master.flightmode` check; exits with code 4 if not GUIDED. NO auto-switch, NO mode-change spam during run. Mode change during operation logged via HEARTBEAT monitoring; tx loop suppresses sends when not GUIDED.
+- `DISTANCE_SENSOR` (msg 132) subscribed at 5 Hz for real range-to-target (replaces simulated LiDAR). Falls back to simulation when `--simulate-distance` or `--no-mavlink`.
+- Telemetry feedback via `VFR_HUD` (groundspeed/climb shown as `feedback=` line in OSD beside the commanded velocity)
+- Exit safety: sends one final zero-velocity `SET_POSITION_TARGET_LOCAL_NED` to halt the drone before disconnect.
+
+**Status:** compile-clean, CLI validation passes (--live-fly+--no-mavlink conflict catches, --tx-rate<4 rejects, etc.). **Not yet tested on the Pi.** Next session priority: BLANK-mode Pi test with autopilot DISARMED to validate state machine + telemetry, then conservative `--live-fly` hover test with observer on the kill switch.
+
+**Run commands (Pi):**
+```bash
+# BLANK mode (safe, no real velocity commands sent)
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760
+
+# LIVE-FLY (real flight — observer on RC override at all times)
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --live-fly \
+  --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \
+  --target-distance-cm 300 --distance-tolerance-cm 30
+
+# Pure dry-run (no autopilot at all — uses simulated LiDAR like drone_simulation)
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --no-mavlink
+```
+
+The existing gimbal+fire script (`tf_live_inferenceV2_gimbal_auto.py`) is unchanged — it remains the gimbal aiming + autonomous firing path. The new drone script is movement-only; if both are needed in flight, run them as two processes (each opens its own MAVLink connection to `tcp:10.42.0.1:5760`).
+
+See `[[drone-automation-script]]` memory for full architecture details and per-phase behavior.
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-14 late — autonomous tracking + ACK-gated DO_REPEAT_RELAY firing)
 
 **Two subsystems live in `test/tf_live_inferenceV2_gimbal_auto.py`. Tracking has been user-validated end-to-end. Fire path was just refactored from the DO_SET_RELAY ON/OFF + RELAY_STATUS-gated design (user-validated earlier in the session) to a simpler DO_REPEAT_RELAY + COMMAND_ACK-gated design — needs a Pi test to re-validate before being called "final".**
 

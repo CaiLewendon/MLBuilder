@@ -1,5 +1,57 @@
 # Kanban
 
+## Done (2026-05-15 — drone-movement script built; NEEDS Pi BLANK-mode + flight test)
+
+New file: `test/tf_live_inferenceV2_drone_auto.py` (1727 lines).
+
+### What it does
+Autonomous drone-positioning loop that combines:
+- The 7-state control machine from `tf_live_infrence_drone_simulation.py` (NO_TARGET → CENTERING → APPROACH → HOLD → LOCKED_HOLD → ALTITUDE_ADJUST → FINAL_HOLD), ported verbatim including gains, deadbands, confirmation-frame logic, sticky altitude target, sign conventions, full OSD overlay.
+- The 4-thread architecture from `tf_live_inferenceV2_gimbal_auto.py` (capture / inference / drone_tx / drone_rx). RTSP camera, TFLiteModel, filter_detections / crop_at / CLAHE — all reused.
+- New `MovementLink` class (mirrors `GimbalLink`) that:
+  - Sends `SET_POSITION_TARGET_LOCAL_NED` (msg 84) in body frame at `--tx-rate` Hz (default 10 Hz, must be ≥4 to keep ArduPilot from timing out).
+  - Type mask = `0x7C7` (KEEP velocity bits 3/4/5 and yaw_rate bit 11; IGNORE position/accel/force/yaw).
+  - Frame = `MAV_FRAME_BODY_NED = 8`.
+  - Converts yaw_rate from deg/s (user-facing, sim units) to rad/s at the transmit boundary.
+  - Captures HEARTBEAT (mode monitoring via `master.flightmode`), DISTANCE_SENSOR (range-to-target), VFR_HUD (velocity feedback for OSD), LOCAL_POSITION_NED, COMMAND_ACK (for SET_MESSAGE_INTERVAL ACKs), STATUSTEXT.
+
+### Operating modes (mirror of gimbal_auto's --live-fire pattern)
+- **DEFAULT** (no flag): BLANK mode. Connects to MAVLink, reads telemetry, computes commands, **does NOT send `SET_POSITION_TARGET_LOCAL_NED`**. Logs `[BLANK SEND]` representative line at 1 Hz so operator sees what would happen.
+- **`--live-fly`**: real sends. Required to fly.
+- **`--no-mavlink`**: pure dry-run with simulated LiDAR (drift+jitter model from drone_simulation). Useful for laptop testing.
+
+### Startup GUIDED-mode gate
+Reads `master.flightmode` after `wait_heartbeat()`. If not `"GUIDED"`: prints clear message, exits with code 4. **No `MAV_CMD_DO_SET_MODE` sent — operator action only**, per user's explicit instruction *"we should not be spamming the flight computer with saying that we need to be in guided, we should just say at the start to switch and confirm we are in guided before starting."*
+
+During operation: HEARTBEAT is monitored in the rx thread. If mode leaves GUIDED, the tx thread suppresses sends and logs `[MODE LOST]` rate-limited to once per 2 seconds.
+
+Can be bypassed with `--no-guided-check` for ground bench testing (autopilot disarmed, e.g., in STABILIZE).
+
+### DISTANCE_SENSOR (msg 132) as the real range source
+Subscribed at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) on connect. The state machine reads from `link.get_distance_cm()` (with staleness check) instead of the simulated LiDAR. If no DISTANCE_SENSOR is received within `--distance-sensor-timeout` (default 5 s) the script exits with code 5 unless `--simulate-distance` is passed.
+
+### COMMAND_ACK usage
+SET_POSITION_TARGET_LOCAL_NED is NOT a `command_long` — it's a setpoint message and never ACKs individually. Verification is by telemetry feedback (VFR_HUD groundspeed/climb shown in OSD next to commanded velocity). COMMAND_ACK is still captured in `run_rx_loop` for the one-shot SET_MESSAGE_INTERVAL commands and any future emergency commands.
+
+### Exit safety
+`finally` block sends ONE final zero-velocity `SET_POSITION_TARGET_LOCAL_NED` (`vx=vy=vz=yaw_rate=0`) before closing the MAVLink connection. Halts the drone on Ctrl-C / crash / normal exit.
+
+### Compile + arg validation
+- `python3 -m py_compile test/tf_live_inferenceV2_drone_auto.py` → OK
+- `--live-fly` + `--no-mavlink` → conflict caught, exit 6
+- `--tx-rate` < 4.0 → `parser.error`
+- Without `--process` → exit 2 (mirrors gimbal_auto behavior)
+- All drone_simulation arg validation preserved
+
+### Status: NEEDS Pi VALIDATION
+Compile-clean, no syntactical issues, all CLI flags exposed correctly. **Not yet flown.** Next session priority:
+1. BLANK-mode Pi test with autopilot connected, drone DISARMED. Watch logs for GUIDED check pass, DISTANCE_SENSOR streaming, state machine progressing.
+2. Mode-loss recovery test: switch out of GUIDED mid-test → script logs `[MODE LOST]` and suppresses sends.
+3. Conservative hover test with `--live-fly` and observer on RC override:
+   `--max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0`
+
+The existing `tf_live_inferenceV2_gimbal_auto.py` is unchanged. Both scripts can run as separate processes if both gimbal aiming and drone movement are needed simultaneously.
+
 ## Done (2026-05-14 late #2 — fire path refactored: DO_REPEAT_RELAY + COMMAND_ACK-gated; NEEDS PI RE-VALIDATION)
 
 After the DO_SET_RELAY + RELAY_STATUS-gated state machine was user-validated working, refactored the fire path on user request to use `DO_REPEAT_RELAY` (mirroring QGC's "Shoot Gun" exactly) with `COMMAND_ACK` as the confirmation source instead of `RELAY_STATUS`.

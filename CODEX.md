@@ -242,3 +242,121 @@ Skips camera/TFLite/threading entirely. Connects MAVLink → calls `center_gimba
 - New: `test/tf_live_inferenceV2_gimbal_auto.py` (~530 lines)
 - New: `ailearn.sh` at repo root (copied from `~/Documents/aerospace2025-26/UAS_Competition_task_1_2026/CODEX/ailearn.sh`; was missing from this repo)
 - Regenerated: `CODEX/AILEARN_REPORT.md`
+
+---
+
+## 2026-05-14 Late Session — Slew-rate-limited tracking + DO_REPEAT_RELAY/COMMAND_ACK fire path
+
+Two big subsystems converged this session.
+
+### Gimbal control law — final architecture (USER-VALIDATED)
+The cumulative-P integrator (`current_yaw += yaw_gain * err_x`) was overshooting on real hardware whenever the gimbal couldn't slew fast enough. After several wrong turns (per-frame step clamps, lock-and-hold state machine, tiny gains, settle-delay) the fix was a **two-tier control system** owned by `GimbalLink`:
+- Inference thread computes `wished_yaw = link.get_current() + yaw_gain * err_x` FRESH every frame (not integrated). Reference is the actual transmitted position.
+- TX thread (20 Hz) ramps `current_yaw` toward `wished_yaw` by at most `max_slew_rate_yaw / 20` degrees per tick. Hard rate limit.
+
+Defaults: `yaw_gain=12, pitch_gain=10` (sim values, unchanged), `max_slew_rate_yaw=2.0, max_slew_rate_pitch=1.5` (deg/sec). User confirmed smooth convergence without overshoot.
+
+Added `--start-from-current` flag: reads `MOUNT_STATUS` or `GIMBAL_DEVICE_ATTITUDE_STATUS` and starts the controller from the gimbal's actual orientation. User confirmed working — gimbal reported `pitch=+37.71 yaw=+1.13` and tracking continued smoothly.
+
+### Fire control — DO_REPEAT_RELAY + COMMAND_ACK-gated (current iteration)
+Iterated through multiple wrong turns:
+1. **First try with `DO_SET_RELAY` (181) on relay 2** — wrong command, wrong relay per user's QGC config.
+2. **`DO_REPEAT_RELAY` (182) on relay 1 (correct shape)** — user confirmed via QGC actions file `mavCmd 182 param1 1 param2 1 param3 2`.
+3. **Double-send DO_REPEAT_RELAY 50ms apart** — caused on/off/on/off chatter from overlapping autopilot pulse state machines. User correctly identified as masking, not fixing.
+4. **DO_SET_RELAY ON + timer + OFF + RELAY_STATUS-gated 5-phase state machine** — user-validated working. *"that worked"*.
+5. **Refactored back to DO_REPEAT_RELAY per user request** — first try with RELAY_STATUS-gated transitions got stuck in ARMING forever because `RELAY_STATUS` reports commanded final state, and a 1-cycle DO_REPEAT_RELAY ends where it started (so the bit may never read 1 during the cycle).
+6. **Final: COMMAND_ACK-gated 4-phase machine (IDLE → ARMING → FIRING → COOLDOWN)** — user identified this as the fix: *"we should also be able to check the ack command from do repeat relay to verify the states no?"*. Compile-clean; needs Pi re-validation.
+
+Subscribed `RELAY_STATUS` (msg 376) at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) at MAVLink connect — kept for log visibility even though it doesn't gate.
+
+ACK capture in `GimbalLink._last_repeat_relay_ack_result / _time`; `run_rx_loop` parses cmd=182 ACKs.
+
+### Key learnings (memory files: `[[do-set-vs-do-repeat-relay]]` + `[[command-ack-for-do-repeat-relay]]`)
+- `DO_REPEAT_RELAY cycles=1, period=N` = N/2 sec ON + N/2 sec OFF. NOT "ON for N seconds" directly.
+- Double-sending DO_REPEAT_RELAY corrupts the autopilot's state machine.
+- Mixing DO_SET_RELAY OFF mid-cycle interrupts a DO_REPEAT_RELAY cycle (use only for intentional aborts/safety).
+- `RELAY_STATUS` is fine for DO_SET_RELAY gating, broken for 1-cycle DO_REPEAT_RELAY gating. Use `COMMAND_ACK` instead.
+- QGC "Shoot Gun" action is the canonical reference: `cmd=182 param1=1 param2=1 param3=2`.
+
+### `--live-fire` repurposed as one-shot CLI action in manual_gimbal_control.py
+After user reported erratic toggling from the panel's input loop, made `--live-fire` an action flag: connect → send ONE DO_REPEAT_RELAY → wait for ACK → exit. No panel, no keyboard, no threads. Used as the isolation harness that proved the relay command works in a single linear code path before trusting it in the autonomous loop. Memory: `[[manual-gimbal-fire-isolation]]`, `[[isolate-before-concurrency-debug]]`.
+
+### Files this session
+- Updated: `test/tf_live_inferenceV2_gimbal_auto.py` (~1235 lines final)
+- Updated: `test/manual_gimbal_control.py` (--live-fire = one-shot)
+- Memory: 5 new memory files (`project_fire_state_machine.md`, `project_manual_gimbal_fire_isolation.md`, `feedback_do_set_vs_do_repeat_relay.md`, `feedback_isolate_before_concurrency_debug.md`, `feedback_command_ack_for_do_repeat_relay.md`)
+
+---
+
+## 2026-05-15 Session — Autonomous drone-movement script
+
+Built `test/tf_live_inferenceV2_drone_auto.py` (1727 lines). New production script for autonomous drone-positioning that takes the validated control logic from `tf_live_infrence_drone_simulation.py` and wires it to a real ArduPilot Copter via `SET_POSITION_TARGET_LOCAL_NED` (msg 84) in GUIDED mode.
+
+### Decisions reached in plan mode (user-answered AskUserQuestion)
+- **Drone-movement only, no gimbal control** — keeps each script focused. `tf_live_inferenceV2_gimbal_auto.py` handles gimbal aiming + firing as a separate process if needed.
+- **Real DISTANCE_SENSOR (msg 132)** subscribed via SET_MESSAGE_INTERVAL at 5 Hz — replaces the simulated LiDAR. Falls back to simulation only with `--simulate-distance` or `--no-mavlink`.
+- **`--live-fly` flag** (default OFF = BLANK; on = real sends) — mirrors `--live-fire` pattern from gimbal_auto.
+
+### Architecture (mirrors gimbal_auto's 4-thread design)
+- `capture_thread`: RTSP → `latest_frame` slot
+- `inference_thread`: TFLite + filter_detections + 7-state machine + `link.set_velocity(vx, vy=0, vz, yaw_rate_dps)`
+- `drone_tx_thread`: `MovementLink.run_tx_loop` sends `SET_POSITION_TARGET_LOCAL_NED` at `--tx-rate` Hz (default 10). BLANK mode logs `[BLANK SEND]` at 1 Hz instead of transmitting.
+- `drone_rx_thread`: `MovementLink.run_rx_loop` captures HEARTBEAT (mode monitoring), DISTANCE_SENSOR, VFR_HUD, LOCAL_POSITION_NED, COMMAND_ACK, STATUSTEXT.
+
+New `MovementLink` class (mirrors `GimbalLink`): lock-protected velocity setpoint, telemetry capture, mode monitoring via `master.flightmode`, exit halt safety (`send_halt()`).
+
+### 7-state machine ported verbatim from drone_simulation
+`NO_TARGET → CENTERING → APPROACH → HOLD → LOCKED_HOLD → ALTITUDE_ADJUST → FINAL_HOLD`. Same gains, deadbands, `lock_confirm_frames=8`, `altitude_lock_confirm_frames=8`, sticky `sim_target_cy` after lock, full OSD.
+
+### MAVLink wire format
+- Command: `SET_POSITION_TARGET_LOCAL_NED` (msg 84). NOT a `command_long`; doesn't ACK individually.
+- Frame: `MAV_FRAME_BODY_NED = 8` (body-relative; +x=forward, +y=right, +z=down).
+- Type mask: `0x7C7` (IGNORE position+accel+force+yaw; KEEP velocity x/y/z + yaw_rate).
+- yaw_rate converted from user-facing deg/s (sim units) to rad/s at the transmit boundary.
+- Send rate: `--tx-rate` Hz, default 10, MUST be ≥4 (ArduPilot setpoint timeout).
+- Continuous transmission required — unlike DO_MOUNT_CONTROL the autopilot doesn't buffer setpoints.
+
+### Startup GUIDED-mode gate
+After `wait_heartbeat()`, checks `master.flightmode`. If not `"GUIDED"`, prints clear error and exits with code 4. **No `MAV_CMD_DO_SET_MODE` sent** — operator action only, per user's explicit instruction: *"we should not be spamming the flight computer with saying that we need to be in guided, we should just say at the start to switch and confirm we are in guided before starting."* Can be bypassed with `--no-guided-check` for ground bench testing.
+
+### Mode monitoring during operation
+`run_rx_loop` parses every HEARTBEAT, updates `_last_heartbeat`. On mode change, prints `[MODE CHANGE] OLD -> NEW`. TX loop checks `link.is_guided()` before each send; if not guided, suppresses send and logs `[MODE LOST]` rate-limited to once per 2 seconds.
+
+### Telemetry subscriptions on connect
+Via `MAV_CMD_SET_MESSAGE_INTERVAL` (511):
+- HEARTBEAT (msg 0) @ 4 Hz — mode monitoring
+- DISTANCE_SENSOR (msg 132) @ 5 Hz — range-to-target
+- LOCAL_POSITION_NED (msg 32) @ 5 Hz — position feedback
+- VFR_HUD (msg 74) @ 5 Hz — groundspeed/climb feedback (shown in OSD as `feedback=`)
+
+### Exit safety
+`finally` block sends ONE final zero-velocity `SET_POSITION_TARGET_LOCAL_NED` (`vx=vy=vz=yaw_rate=0`) before disconnect, halting the drone on Ctrl-C / crash / normal exit. Only matters in `--live-fly`.
+
+### Files this session
+- New: `test/tf_live_inferenceV2_drone_auto.py` (1727 lines)
+- Memory: `project_drone_automation_script.md` (new comprehensive entry)
+- Updated: CLAUDE.md (new WHERE WE LEFT OFF), KANBAN.md (new Done block), CONTEXT.md (Late Addendum #3), MEMORY.md (index), this CODEX.md
+
+### Status
+- ✅ Compile-clean (`python3 -m py_compile`)
+- ✅ CLI validation works (`--live-fly+--no-mavlink` conflict catches, `--tx-rate<4` rejects)
+- ✅ All flags exposed (`--help` audited)
+- ❌ Not yet tested on the Pi
+- ❌ Not yet flown
+
+### Next-session priorities
+1. **Pi BLANK-mode test** with autopilot connected and drone DISARMED:
+   ```bash
+   python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+     --tpu -p --no-output --mavlink tcp:10.42.0.1:5760
+   ```
+   Watch for `[GUIDED CHECK]` pass, `[BLANK SEND]` lines at 1 Hz, DISTANCE_SENSOR streaming, state machine progression NO_TARGET → CENTERING → APPROACH → HOLD.
+
+2. **Mode-loss recovery test**: switch out of GUIDED mid-test. Script should log `[MODE LOST]` and suppress sends within ~250 ms (one HEARTBEAT period at 4 Hz).
+
+3. **Conservative `--live-fly` hover** with observer on RC override:
+   ```bash
+   --live-fly --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 --target-distance-cm 300
+   ```
+
+4. **Pi RE-VALIDATION of the gimbal fire path** (still pending from prior session — DO_REPEAT_RELAY + COMMAND_ACK-gated state machine). Watch for `[ACK-RELAY] cmd=182 result=0`. If it doesn't arrive, fall back to the DO_SET_RELAY version one git commit earlier.

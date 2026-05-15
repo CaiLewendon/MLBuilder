@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-14 23:58:13 PDT
+Generated: 2026-05-15 01:13:38 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,10 +21,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                ca5f44485a555198f4715e6c2ab722fe8029cc86 I got hte gimbal autonomy finished
+* cPCcputestinglocally                e719ba5e0525eae963d61f52a64d6caac02f0d6e added auto drone script for approach
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally ca5f44485a555198f4715e6c2ab722fe8029cc86 I got hte gimbal autonomy finished
+  remotes/origin/cPCcputestinglocally e719ba5e0525eae963d61f52a64d6caac02f0d6e added auto drone script for approach
   remotes/origin/cTPUtest             714f8c78346f8d84aa6cb8d9d252e1a034af4e24 divyesh is financially iliterate
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
@@ -35,10 +35,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ```text
 ## cPCcputestinglocally...origin/cPCcputestinglocally
  M CLAUDE.md
+ M CODEX.md
  M CODEX/AILEARN_REPORT.md
  M CONTEXT.md
  M KANBAN.md
- M test/tf_live_inferenceV2_gimbal_auto.py
 
 ```
 
@@ -8195,6 +8195,7 @@ test/__pycache__/pi_mavlink_fullsuite_test.cpython-312.pyc
 test/__pycache__/rebuild_tpu_model_pi.cpython-312.pyc
 test/__pycache__/tf_inference_data_live.cpython-312.pyc
 test/__pycache__/tflite_raw_output_probe.cpython-312.pyc
+test/__pycache__/tf_live_inferenceV2_drone_auto.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_gimbal_auto.cpython-312.pyc
 test/__pycache__/tf_live_infrence.cpython-312.pyc
 test/__pycache__/tf_live_infrence_drone_simulation.cpython-312.pyc
@@ -8204,6 +8205,7 @@ test/rebuild_tpu_model_pi.py
 test/tf_inference_data_live.py
 test/tflite_raw_output_probe.py
 test/tf_live_inferenceV2_backup.py
+test/tf_live_inferenceV2_drone_auto.py
 test/tf_live_inferenceV2_gimbal_auto.py
 test/tf_live_inferenceV2.py
 test/tf_live_infrence_drone_simulation.py
@@ -126041,5 +126043,7 @@ ef719ce | 2026-05-02 |  | it works hell yea
 1105e25 | 2026-05-10 |  | updated test suite
 1fdd0c2 | 2026-05-12 |  | documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
 0cadeec | 2026-05-14 |  | Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
-ca5f444 | 2026-05-14 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | I got hte gimbal autonomy finished
+ca5f444 | 2026-05-14 |  | I got hte gimbal autonomy finished
+1be6094 | 2026-05-15 |  | do repeat relay command for gimbal fireing and ack command state confirmation
+e719ba5 | 2026-05-15 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | added auto drone script for approach
 ```
