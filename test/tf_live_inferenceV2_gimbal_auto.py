@@ -47,6 +47,11 @@ GIMBAL_PITCH_MIN_DEG = -45.0
 GIMBAL_PITCH_MAX_DEG = 45.0
 MAV_CMD_DO_MOUNT_CONTROL = 205
 MAV_MOUNT_MODE_MAVLINK_TARGETING = 2
+MAV_CMD_DO_SET_RELAY = 181
+MAV_CMD_DO_REPEAT_RELAY = 182
+MAV_CMD_REQUEST_MESSAGE = 512
+MAV_CMD_SET_MESSAGE_INTERVAL = 511
+MAVLINK_MSG_ID_RELAY_STATUS = 376
 
 COCO80_NAMES = [
     "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
@@ -216,6 +221,62 @@ def send_mount_control(master, pitch_deg: float, yaw_deg: float) -> None:
     )
 
 
+def send_relay(master, relay_num: int, state: int) -> None:
+    """MAV_CMD_DO_SET_RELAY (181). Used here as a SAFETY OFF after a fire burst
+    completes, and on script exit."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_SET_RELAY,
+        0,
+        float(int(relay_num)),
+        float(int(bool(state))),
+        0.0, 0.0, 0.0, 0.0, 0.0,
+    )
+
+
+def send_repeat_relay(master, relay_num: int, cycles: int, cycle_time_s: float) -> None:
+    """MAV_CMD_DO_REPEAT_RELAY (182). Matches the QGroundControl 'Shoot Gun'
+    action: param1=relay, param2=cycles, param3=cycle_time. ArduPilot owns the
+    pulse timing — the script just re-issues the command when continuous fire
+    is desired (i.e. target stays centered past the burst duration)."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_REPEAT_RELAY,
+        0,
+        float(int(relay_num)),
+        float(int(cycles)),
+        float(cycle_time_s),
+        0.0, 0.0, 0.0, 0.0,
+    )
+
+
+def set_message_interval(master, msg_id: int, interval_us: int) -> None:
+    """MAV_CMD_SET_MESSAGE_INTERVAL (511). Request streaming of msg_id at interval."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        float(int(msg_id)),
+        float(int(interval_us)),
+        0.0, 0.0, 0.0, 0.0, 0.0,
+    )
+
+
+def request_message(master, msg_id: int) -> None:
+    """MAV_CMD_REQUEST_MESSAGE (512). Ask the autopilot to send msg_id once."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_REQUEST_MESSAGE,
+        0,
+        float(int(msg_id)),
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    )
+
+
 def request_streams(master, rate_hz: int) -> None:
     from pymavlink import mavutil
 
@@ -232,40 +293,67 @@ def request_streams(master, rate_hz: int) -> None:
 
 
 class GimbalLink:
-    """Owns the MAVLink connection, the current setpoint, and the transmit cadence.
+    """Owns the MAVLink connection. Holds two setpoints:
+
+      - wished_pitch / wished_yaw : where the controller wants the gimbal (inference thread)
+      - current_pitch / current_yaw : what we've actually told the gimbal (TX thread)
+
+    Each TX tick, current_* is stepped toward wished_* by at most step_per_tick. This
+    rate-limits the transmitted setpoint so the gimbal can physically execute each
+    command before the next one arrives. The integrator in the inference thread can
+    set wished_* freely; current_* will catch up at the gimbal's physical slew rate.
 
     Threading model:
-      - inference_thread calls update_setpoint() whenever a new detection updates yaw/pitch
-      - gimbal_tx_thread (driven by run_tx_loop) wakes up at send_interval, transmits if
-        dirty, otherwise re-sends the last setpoint at heartbeat_send_interval to keep
-        the gimbal driver alive (same pattern as manual_gimbal_control.py).
+      - inference_thread calls set_wished() each frame
+      - gimbal_tx_thread (driven by run_tx_loop) wakes up at send_interval, ramps
+        current_* toward wished_* by at most step_per_tick, and transmits.
     """
 
-    def __init__(self, master, send_rate_hz: float, heartbeat_send_rate_hz: float, dry_run: bool):
+    def __init__(self, master, send_rate_hz: float, heartbeat_send_rate_hz: float,
+                 max_slew_rate_yaw_dps: float, max_slew_rate_pitch_dps: float,
+                 initial_pitch: float, initial_yaw: float, dry_run: bool):
         self.master = master
         self.dry_run = dry_run
         self.send_interval = 1.0 / float(send_rate_hz)
         self.heartbeat_send_interval = 1.0 / float(heartbeat_send_rate_hz)
+        self.step_per_tick_yaw = float(max_slew_rate_yaw_dps) * self.send_interval
+        self.step_per_tick_pitch = float(max_slew_rate_pitch_dps) * self.send_interval
 
         self._lock = threading.Lock()
-        self._pitch = 0.0
-        self._yaw = 0.0
-        self._dirty = True
+        self._pitch = float(initial_pitch)
+        self._yaw = float(initial_yaw)
+        self._wished_pitch = float(initial_pitch)
+        self._wished_yaw = float(initial_yaw)
 
         self.send_count = 0
         self.last_send_time = None
         self.last_send_err = None
 
-    def update_setpoint(self, pitch: float, yaw: float) -> None:
-        with self._lock:
-            if pitch != self._pitch or yaw != self._yaw:
-                self._pitch = pitch
-                self._yaw = yaw
-                self._dirty = True
+        # Latest RELAY_STATUS (msg 376) captured by run_rx_loop.
+        self._relay_on_mask = 0
+        self._relay_present_mask = 0
+        self._relay_status_time = None  # time.monotonic() of last update; None=never
 
-    def get_setpoint(self) -> tuple:
+    def get_relay_status(self):
+        """Returns (on_mask, present_mask, age_seconds_or_None)."""
+        with self._lock:
+            if self._relay_status_time is None:
+                return self._relay_on_mask, self._relay_present_mask, None
+            return (self._relay_on_mask, self._relay_present_mask,
+                    time.monotonic() - self._relay_status_time)
+
+    def set_wished(self, pitch: float, yaw: float) -> None:
+        with self._lock:
+            self._wished_pitch = float(pitch)
+            self._wished_yaw = float(yaw)
+
+    def get_current(self) -> tuple:
         with self._lock:
             return self._pitch, self._yaw
+
+    def get_wished(self) -> tuple:
+        with self._lock:
+            return self._wished_pitch, self._wished_yaw
 
     def _transmit(self, pitch: float, yaw: float) -> None:
         if self.dry_run or self.master is None:
@@ -282,30 +370,37 @@ class GimbalLink:
         self.send_count += 1
 
     def run_tx_loop(self, stop_event: threading.Event) -> None:
-        last_send = 0.0
-        last_heartbeat_send = 0.0
-
-        self._transmit(self._pitch, self._yaw)
+        with self._lock:
+            self._transmit(self._pitch, self._yaw)
         last_send = time.monotonic()
         last_heartbeat_send = last_send
 
         while not stop_event.is_set():
             now = time.monotonic()
-            with self._lock:
-                dirty = self._dirty
-                pitch = self._pitch
-                yaw = self._yaw
-                if dirty:
-                    self._dirty = False
+            if (now - last_send) >= self.send_interval:
+                with self._lock:
+                    dy = self._wished_yaw - self._yaw
+                    dp = self._wished_pitch - self._pitch
+                    if dy > self.step_per_tick_yaw:
+                        dy = self.step_per_tick_yaw
+                    elif dy < -self.step_per_tick_yaw:
+                        dy = -self.step_per_tick_yaw
+                    if dp > self.step_per_tick_pitch:
+                        dp = self.step_per_tick_pitch
+                    elif dp < -self.step_per_tick_pitch:
+                        dp = -self.step_per_tick_pitch
+                    self._yaw += dy
+                    self._pitch += dp
+                    moved = abs(dy) > 1e-6 or abs(dp) > 1e-6
+                    pitch_now = self._pitch
+                    yaw_now = self._yaw
 
-            if dirty and (now - last_send) >= self.send_interval:
-                self._transmit(pitch, yaw)
-                last_send = now
-                last_heartbeat_send = now
-            elif (now - last_heartbeat_send) >= self.heartbeat_send_interval:
-                self._transmit(pitch, yaw)
-                last_send = now
-                last_heartbeat_send = now
+                if moved or (now - last_heartbeat_send) >= self.heartbeat_send_interval:
+                    self._transmit(pitch_now, yaw_now)
+                    last_send = now
+                    last_heartbeat_send = now
+                else:
+                    last_send = now
 
             time.sleep(0.005)
 
@@ -327,14 +422,71 @@ class GimbalLink:
             t = msg.get_type()
             if t == "COMMAND_ACK":
                 try:
-                    if int(msg.command) == MAV_CMD_DO_MOUNT_CONTROL:
-                        print(f"[ACK] cmd={msg.command} result={msg.result}", flush=True)
+                    cmd = int(msg.command)
+                    if cmd == MAV_CMD_DO_MOUNT_CONTROL:
+                        print(f"[ACK] cmd={cmd} result={msg.result}", flush=True)
+                    elif cmd == MAV_CMD_DO_SET_RELAY or cmd == MAV_CMD_DO_REPEAT_RELAY:
+                        print(f"[ACK-RELAY] cmd={cmd} result={msg.result} "
+                              f"(0=ACCEPTED, 4=FAILED, 2=DENIED, 5=UNSUPPORTED)", flush=True)
+                except Exception:
+                    pass
+            elif t == "RELAY_STATUS":
+                try:
+                    with self._lock:
+                        self._relay_on_mask = int(getattr(msg, "on", 0))
+                        self._relay_present_mask = int(getattr(msg, "present", 0))
+                        self._relay_status_time = time.monotonic()
                 except Exception:
                     pass
             elif t == "STATUSTEXT":
                 text = (getattr(msg, "text", "") or "").strip()
                 if text:
                     print(f"[STATUSTEXT sev={getattr(msg, 'severity', '?')}] {text}", flush=True)
+
+
+def read_current_gimbal_position(master, timeout: float) -> tuple:
+    """Drain MAVLink inbox briefly looking for MOUNT_STATUS or
+    GIMBAL_DEVICE_ATTITUDE_STATUS. Returns (pitch_deg, yaw_deg) or None.
+
+    Used by --start-from-current so the controller's initial reference matches the
+    gimbal's actual physical orientation rather than slewing it to (0,0) first.
+    """
+    if master is None:
+        return None
+    import math
+
+    end = time.monotonic() + float(timeout)
+    while time.monotonic() < end:
+        remaining = max(0.05, end - time.monotonic())
+        try:
+            msg = master.recv_match(blocking=True, timeout=remaining)
+        except Exception as e:
+            print(f"[MAVLINK] recv_match failed during initial read: {e}", flush=True)
+            return None
+        if msg is None or msg.get_type() == "BAD_DATA":
+            continue
+        t = msg.get_type()
+        if t == "MOUNT_STATUS":
+            try:
+                pitch_cdeg = float(getattr(msg, "pointing_a", 0))
+                yaw_cdeg = float(getattr(msg, "pointing_c", 0))
+                return pitch_cdeg / 100.0, yaw_cdeg / 100.0
+            except Exception:
+                continue
+        if t == "GIMBAL_DEVICE_ATTITUDE_STATUS":
+            try:
+                q = list(getattr(msg, "q", []))
+                if len(q) != 4:
+                    continue
+                w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+                sinp = 2.0 * (w * y - z * x)
+                sinp = max(-1.0, min(1.0, sinp))
+                pitch_rad = math.asin(sinp)
+                yaw_rad = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                return math.degrees(pitch_rad), math.degrees(yaw_rad)
+            except Exception:
+                continue
+    return None
 
 
 def center_gimbal(master, duration: float, rate_hz: float, dry_run: bool) -> None:
@@ -380,6 +532,13 @@ def open_mavlink(connection_str: str, heartbeat_timeout: float, stream_rate: int
             flush=True,
         )
         request_streams(master, stream_rate)
+        try:
+            set_message_interval(master, MAVLINK_MSG_ID_RELAY_STATUS, 200_000)
+            print(f"[MAVLINK] Requested RELAY_STATUS (msg {MAVLINK_MSG_ID_RELAY_STATUS}) "
+                  f"@ 5 Hz for closed-loop relay verification", flush=True)
+        except Exception as e:
+            print(f"[MAVLINK] WARNING: SET_MESSAGE_INTERVAL for RELAY_STATUS failed: {e}",
+                  flush=True)
         return master
     except Exception as e:
         print(f"[MAVLINK] WARNING: connection/heartbeat failed: {e}", flush=True)
@@ -439,11 +598,55 @@ def main():
     parser.add_argument("--deadband", type=float, default=0.08,
                         help="Normalized image-center deadband before updating gimbal angles")
     parser.add_argument("--yaw-gain", type=float, default=12.0,
-                        help="Yaw gain (deg per frame at full-scale horizontal error)")
+                        help="Yaw gain — same as simulation script. Controller computes "
+                             "wished_yaw = current_yaw + yaw_gain * err_x each frame. "
+                             "The TX thread ramps the actual transmitted setpoint toward "
+                             "wished_yaw at --max-slew-rate-yaw deg/sec.")
     parser.add_argument("--pitch-gain", type=float, default=10.0,
-                        help="Pitch gain (deg per frame at full-scale vertical error)")
-    parser.add_argument("--initial-pitch", type=float, default=0.0)
-    parser.add_argument("--initial-yaw", type=float, default=0.0)
+                        help="Pitch gain — same as simulation script. wished_pitch = "
+                             "current_pitch - pitch_gain * err_y. TX ramps toward it.")
+    parser.add_argument("--max-slew-rate-yaw", type=float, default=2.0,
+                        help="Maximum yaw slew rate (deg/sec) for the TRANSMITTED setpoint. "
+                             "Default 2 deg/sec -> 0.10 deg per tick at 20 Hz send rate. "
+                             "Very gentle micro-stepping. Raise to 5-10 if convergence is too slow.")
+    parser.add_argument("--max-slew-rate-pitch", type=float, default=1.5,
+                        help="Maximum pitch slew rate (deg/sec) for the TRANSMITTED setpoint. "
+                             "Default 1.5 deg/sec -> 0.075 deg per tick at 20 Hz. "
+                             "Raise to 4-8 if too slow.")
+    parser.add_argument("--start-from-current", action="store_true",
+                        help="At startup, read the gimbal's actual orientation from MOUNT_STATUS "
+                             "or GIMBAL_DEVICE_ATTITUDE_STATUS and use that as the initial "
+                             "reference. If neither message arrives within --read-current-timeout, "
+                             "the script aborts. Without this flag the script CENTERS the gimbal "
+                             "(sends (0,0)) at startup before tracking begins.")
+    parser.add_argument("--read-current-timeout", type=float, default=2.0,
+                        help="Seconds to wait for MOUNT_STATUS / GIMBAL_DEVICE_ATTITUDE_STATUS "
+                             "when --start-from-current is set (default: 2.0).")
+    parser.add_argument("--initial-pitch", type=float, default=0.0,
+                        help="Initial pitch (deg) if not using --start-from-current.")
+    parser.add_argument("--initial-yaw", type=float, default=0.0,
+                        help="Initial yaw (deg) if not using --start-from-current.")
+
+    parser.add_argument("--no-fire", action="store_true",
+                        help="Disable all firing logic. The script will track but never log "
+                             "fire events nor send relay commands. Use for camera/gimbal-only "
+                             "testing without any weapon engagement.")
+    parser.add_argument("--live-fire", action="store_true",
+                        help="DANGEROUS. Send real MAV_CMD_DO_SET_RELAY ON/OFF commands. On each "
+                             "centering event the script sends ON, holds for --fire-period seconds, "
+                             "then sends OFF (3x for packet-loss safety). Without this flag the "
+                             "script runs in BLANK mode (logs only, no relay commands).")
+    parser.add_argument("--fire-relay", type=int, default=1,
+                        help="Relay instance for DO_SET_RELAY param1 (default: 1, matches the "
+                             "QGroundControl 'Shoot Gun' relay).")
+    parser.add_argument("--fire-period", type=float, default=5.0,
+                        help="Seconds the relay is held ON per burst. Script sends DO_SET_RELAY ON, "
+                             "waits this long, then sends DO_SET_RELAY OFF. Default 5.0.")
+    parser.add_argument("--fire-cooldown", type=float, default=0.5,
+                        help="Seconds of forced OFF between back-to-back bursts. Default 0.5. "
+                             "Gives the autopilot's relay a clean idle window before the next ON. "
+                             "Set to 0 to disable auto-repeat entirely (fire only once per "
+                             "un-center -> re-center event).")
 
     args = parser.parse_args()
 
@@ -470,6 +673,14 @@ def main():
         parser.error("--send-rate and --heartbeat-send-rate must be > 0")
     if args.center_duration <= 0 or args.center_rate <= 0:
         parser.error("--center-duration and --center-rate must be > 0")
+    if args.max_slew_rate_yaw <= 0 or args.max_slew_rate_pitch <= 0:
+        parser.error("--max-slew-rate-yaw and --max-slew-rate-pitch must be > 0")
+    if args.read_current_timeout <= 0:
+        parser.error("--read-current-timeout must be > 0")
+    if args.no_fire and args.live_fire:
+        parser.error("--no-fire and --live-fire are mutually exclusive")
+    if not (0 <= args.fire_relay <= 15):
+        parser.error("--fire-relay must be between 0 and 15")
 
     if args.center_gimbal:
         master = None
@@ -530,17 +741,65 @@ def main():
     print("  gimbal pitch (param1): +up, -down", flush=True)
     print("  control: target right -> yaw+, target left -> yaw-, "
           "target down -> pitch-, target up -> pitch+", flush=True)
+    print(f"[INFO] Slew limits: yaw<={args.max_slew_rate_yaw:.1f} deg/sec, "
+          f"pitch<={args.max_slew_rate_pitch:.1f} deg/sec", flush=True)
+
+    if args.no_fire:
+        fire_mode = "DISABLED"
+    elif args.live_fire:
+        fire_mode = "LIVE"
+    else:
+        fire_mode = "BLANK"
+    print(f"[INFO] Fire mode: {fire_mode} (relay={args.fire_relay}, "
+          f"trigger=centered-in-deadband, continuous)", flush=True)
+    if args.live_fire:
+        print("[WARN] *** LIVE FIRE ENABLED *** real MAV_CMD_DO_SET_RELAY commands "
+              "will be sent. Ctrl-C stops the script and forces relay OFF.", flush=True)
+
+    initial_pitch = clamp(args.initial_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+    initial_yaw = clamp(args.initial_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+    if args.start_from_current:
+        if master is None:
+            print("[INIT] --start-from-current requested but no MAVLink connection; "
+                  "falling back to (initial_pitch, initial_yaw).", flush=True)
+        else:
+            print(f"[INIT] Reading current gimbal orientation (timeout "
+                  f"{args.read_current_timeout:.1f}s)...", flush=True)
+            pos = read_current_gimbal_position(master, args.read_current_timeout)
+            if pos is None:
+                print("[INIT] ERROR: no MOUNT_STATUS or GIMBAL_DEVICE_ATTITUDE_STATUS received. "
+                      "Aborting (rerun without --start-from-current to center first instead).",
+                      flush=True)
+                try:
+                    master.close()
+                except Exception:
+                    pass
+                sys.exit(3)
+            initial_pitch = clamp(pos[0], GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+            initial_yaw = clamp(pos[1], GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+            print(f"[INIT] Read current gimbal: pitch={initial_pitch:+.2f} yaw={initial_yaw:+.2f}",
+                  flush=True)
+    else:
+        if master is not None and not args.no_mavlink:
+            print(f"[INIT] Centering gimbal first (pitch=0, yaw=0) for "
+                  f"{args.center_duration:.2f}s @ {args.center_rate}Hz...", flush=True)
+            center_gimbal(master, args.center_duration, args.center_rate,
+                          dry_run=args.no_mavlink or master is None)
+        initial_pitch = 0.0
+        initial_yaw = 0.0
+        print(f"[INIT] Initial reference: pitch={initial_pitch:+.2f} yaw={initial_yaw:+.2f}",
+              flush=True)
 
     link = GimbalLink(
         master=master,
         send_rate_hz=args.send_rate,
         heartbeat_send_rate_hz=args.heartbeat_send_rate,
+        max_slew_rate_yaw_dps=args.max_slew_rate_yaw,
+        max_slew_rate_pitch_dps=args.max_slew_rate_pitch,
+        initial_pitch=initial_pitch,
+        initial_yaw=initial_yaw,
         dry_run=args.no_mavlink or master is None,
     )
-
-    current_pitch = clamp(args.initial_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
-    current_yaw = clamp(args.initial_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
-    link.update_setpoint(current_pitch, current_yaw)
 
     latest_frame = [None]
     latest_detections = [[]]
@@ -550,8 +809,138 @@ def main():
     frame_event = threading.Event()
     frame_seq = [0]
 
-    gimbal_state = {"pitch": current_pitch, "yaw": current_yaw, "frame_idx": 0}
+    gimbal_state = {
+        "pitch": initial_pitch,
+        "yaw": initial_yaw,
+        "wished_pitch": initial_pitch,
+        "wished_yaw": initial_yaw,
+        "frame_idx": 0,
+        "firing": False,
+        "fire_elapsed": 0.0,
+    }
     gimbal_state_lock = threading.Lock()
+
+    # Fire state machine driven by RELAY_STATUS confirmation.
+    #
+    #   IDLE      → relay confirmed OFF. Waiting for CENTERED target.
+    #   ARMING    → sent DO_SET_RELAY ON. Resending at 2 Hz keepalive.
+    #               Transitions to FIRING when RELAY_STATUS reports relay = ON.
+    #   FIRING    → relay confirmed ON. Holding for fire_period seconds.
+    #               Continues 2 Hz ON reassertion in case of mid-burst dropouts.
+    #   DISARMING → sent DO_SET_RELAY OFF. Resending at 2 Hz keepalive.
+    #               Transitions to COOLDOWN when RELAY_STATUS reports relay = OFF.
+    #   COOLDOWN  → relay confirmed OFF. Idle gap of fire_cooldown seconds.
+    #               2 Hz OFF reassertion. Transitions back to IDLE when expired.
+    #
+    # Every transition that depends on physical relay state requires RELAY_STATUS
+    # confirmation from the autopilot. Time-based transitions (FIRING duration,
+    # COOLDOWN duration) advance on the clock. BLANK mode (--live-fire absent)
+    # auto-confirms after a short simulated lag for testing without firing.
+    fire_burst_duration = float(args.fire_period)
+    fire_keepalive_interval = 0.5  # 2 Hz reassertion of the current target relay state
+    fire_blank_sim_lag = 0.1       # in BLANK mode, simulated RELAY_STATUS confirmation delay
+    fire_state = {
+        "phase": "IDLE",
+        "phase_start_time": time.monotonic(),
+        "last_send": 0.0,
+        "lock_fired": False,
+    }
+
+    def _phase_target_on() -> int:
+        return 1 if fire_state["phase"] in ("ARMING", "FIRING") else 0
+
+    def _send_relay_safe(state_value: int) -> None:
+        if args.live_fire and master is not None:
+            try:
+                send_relay(master, args.fire_relay, state_value)
+            except Exception as e:
+                print(f"[FIRE ERROR] DO_SET_RELAY({state_value}) failed: {e}", flush=True)
+
+    def _enter_phase(new_phase: str, log: str) -> None:
+        fire_state["phase"] = new_phase
+        fire_state["phase_start_time"] = time.monotonic()
+        print(log, flush=True)
+
+    def fire_advance(centered: bool):
+        """Drive the fire state machine. Called every inference frame."""
+        if args.no_fire:
+            return
+        now = time.monotonic()
+
+        # Read autopilot-reported relay state (if available and fresh).
+        on_mask, _, status_age = link.get_relay_status()
+        have_fresh_status = status_age is not None and status_age < 2.0
+        actual_on = ((on_mask >> args.fire_relay) & 1) if have_fresh_status else None
+
+        # 2 Hz keepalive: continuously reassert the desired relay state. Idempotent.
+        target_on = _phase_target_on()
+        if (now - fire_state["last_send"]) >= fire_keepalive_interval:
+            _send_relay_safe(target_on)
+            fire_state["last_send"] = now
+
+        phase = fire_state["phase"]
+        elapsed_phase = now - fire_state["phase_start_time"]
+        mode = "LIVE" if args.live_fire else "BLANK"
+
+        if phase == "IDLE":
+            if centered and not fire_state["lock_fired"]:
+                fire_state["lock_fired"] = True
+                _send_relay_safe(1)
+                fire_state["last_send"] = now
+                _enter_phase(
+                    "ARMING",
+                    f"[{mode} ARMING] sent DO_SET_RELAY({args.fire_relay},1); "
+                    f"awaiting RELAY_STATUS confirmation that bit[{args.fire_relay}]=1",
+                )
+
+        elif phase == "ARMING":
+            confirmed_on = (have_fresh_status and actual_on == 1)
+            blank_sim_ok = (not args.live_fire) and elapsed_phase >= fire_blank_sim_lag
+            if not centered:
+                # Target lost before fire actually started — abort to OFF.
+                _send_relay_safe(0)
+                fire_state["last_send"] = now
+                _enter_phase(
+                    "DISARMING",
+                    f"[FIRE ABORT] target lost before ARMING confirmed; "
+                    f"sent DO_SET_RELAY({args.fire_relay},0); awaiting OFF confirmation",
+                )
+            elif confirmed_on or blank_sim_ok:
+                conf_tag = "RELAY_STATUS confirmed" if confirmed_on else "BLANK simulated"
+                _enter_phase(
+                    "FIRING",
+                    f"[{mode} FIRE ON CONFIRMED] {conf_tag} after {elapsed_phase:.2f}s; "
+                    f"holding for {fire_burst_duration:.2f}s",
+                )
+
+        elif phase == "FIRING":
+            if elapsed_phase >= fire_burst_duration:
+                _send_relay_safe(0)
+                fire_state["last_send"] = now
+                _enter_phase(
+                    "DISARMING",
+                    f"[{mode} BURST DONE] held ON for {elapsed_phase:.2f}s; "
+                    f"sent DO_SET_RELAY({args.fire_relay},0); awaiting OFF confirmation",
+                )
+
+        elif phase == "DISARMING":
+            confirmed_off = (have_fresh_status and actual_on == 0)
+            blank_sim_ok = (not args.live_fire) and elapsed_phase >= fire_blank_sim_lag
+            if confirmed_off or blank_sim_ok:
+                conf_tag = "RELAY_STATUS confirmed" if confirmed_off else "BLANK simulated"
+                _enter_phase(
+                    "COOLDOWN",
+                    f"[{mode} FIRE OFF CONFIRMED] {conf_tag} after {elapsed_phase:.2f}s; "
+                    f"cooldown {args.fire_cooldown:.2f}s before next burst",
+                )
+
+        elif phase == "COOLDOWN":
+            if elapsed_phase >= float(args.fire_cooldown):
+                fire_state["lock_fired"] = False
+                _enter_phase(
+                    "IDLE",
+                    f"[{mode} FIRE READY] cooldown complete; re-armed for next centering event",
+                )
 
     def capture_thread():
         skip = 0
@@ -570,7 +959,6 @@ def main():
             frame_event.set()
 
     def inference_thread():
-        nonlocal current_pitch, current_yaw
         count = 0
         last_seen = 0
         gimbal_frame_idx = 0
@@ -637,33 +1025,75 @@ def main():
                 err_y = (cy - fy) / max(1.0, fy)
                 move_label = direction_label(err_x, err_y, args.deadband)
 
+                # Read where the gimbal actually IS (the TX-thread-ramped commanded position).
+                # Recompute wished from that — NOT from a free-running integrator. The wished
+                # leads `current` by gain*err; as the gimbal physically slews and err shrinks,
+                # wished and current converge. No accumulation, no overshoot.
+                cur_pitch, cur_yaw = link.get_current()
+
                 if move_label != "CENTERED":
-                    current_yaw += args.yaw_gain * err_x
-                    current_pitch -= args.pitch_gain * err_y
-                    current_yaw = clamp(current_yaw, GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
-                    current_pitch = clamp(current_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
-                    link.update_setpoint(current_pitch, current_yaw)
+                    wished_yaw = clamp(cur_yaw + args.yaw_gain * err_x,
+                                        GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+                    wished_pitch = clamp(cur_pitch - args.pitch_gain * err_y,
+                                          GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+                    link.set_wished(wished_pitch, wished_yaw)
+                else:
+                    wished_pitch, wished_yaw = link.get_wished()
+
+                # Drive the fire state machine — gated on centered + RELAY_STATUS confirmation.
+                fire_advance(centered=(move_label == "CENTERED"))
+
+                phase = fire_state["phase"]
+                is_firing = (phase == "FIRING")
+                fire_elapsed = (time.monotonic() - fire_state["phase_start_time"]) if is_firing else 0.0
 
                 with gimbal_state_lock:
-                    gimbal_state["pitch"] = current_pitch
-                    gimbal_state["yaw"] = current_yaw
+                    gimbal_state["pitch"] = cur_pitch
+                    gimbal_state["yaw"] = cur_yaw
+                    gimbal_state["wished_pitch"] = wished_pitch
+                    gimbal_state["wished_yaw"] = wished_yaw
                     gimbal_state["frame_idx"] = gimbal_frame_idx
+                    gimbal_state["firing"] = is_firing
+                    gimbal_state["fire_elapsed"] = fire_elapsed
+
+                fire_mode_tag = "LIVE" if args.live_fire else "BLANK"
+                if is_firing:
+                    fire_info = f"FIRING_{fire_mode_tag}_t={fire_elapsed:.2f}s"
+                else:
+                    fire_info = f"fire_phase={phase}"
 
                 confidence = float(selected.get("confidence", 0.0))
                 print(
                     f"[F{gimbal_frame_idx:06d}] target_bbox=(({int(x1)},{int(y1)}),({int(x2)},{int(y2)})) "
                     f"center=({int(round(cx))},{int(round(cy))}) "
                     f"err=({err_x:+.3f},{err_y:+.3f}) conf={confidence:.3f} dir={move_label} "
-                    f"yaw={current_yaw:.2f} pitch={current_pitch:.2f} "
+                    f"cur=(y{cur_yaw:+.2f},p{cur_pitch:+.2f}) "
+                    f"wished=(y{wished_yaw:+.2f},p{wished_pitch:+.2f}) {fire_info} "
                     f"CMD_LONG cmd={MAV_CMD_DO_MOUNT_CONTROL} "
-                    f"param1={current_pitch:.2f} param2=0.00 param3={current_yaw:.2f} "
+                    f"param1={cur_pitch:.2f} param2=0.00 param3={cur_yaw:.2f} "
                     f"param4=0.00 param5=0.00 param6=0.00 "
                     f"param7={MAV_MOUNT_MODE_MAVLINK_TARGETING}",
                     flush=True,
                 )
             else:
+                cur_pitch, cur_yaw = link.get_current()
+                # Lost target — drive the state machine with centered=False so any
+                # in-progress ARMING aborts (sends OFF, waits for OFF confirmation).
+                # A FIRING burst runs to completion regardless of target loss; the
+                # autopilot's relay state is unchanged until our DISARMING phase.
+                fire_advance(centered=False)
+                phase = fire_state["phase"]
+                is_firing = (phase == "FIRING")
+                fire_elapsed = (time.monotonic() - fire_state["phase_start_time"]) if is_firing else 0.0
+                with gimbal_state_lock:
+                    gimbal_state["pitch"] = cur_pitch
+                    gimbal_state["yaw"] = cur_yaw
+                    gimbal_state["frame_idx"] = gimbal_frame_idx
+                    gimbal_state["firing"] = is_firing
+                    gimbal_state["fire_elapsed"] = fire_elapsed
                 print(f"[F{gimbal_frame_idx:06d}] NO_TARGET hold "
-                      f"yaw={current_yaw:.2f} pitch={current_pitch:.2f}", flush=True)
+                      f"cur=(y{cur_yaw:+.2f},p{cur_pitch:+.2f}) fire_phase={phase}",
+                      flush=True)
 
     t_cap = threading.Thread(target=capture_thread, daemon=True)
     t_inf = threading.Thread(target=inference_thread, daemon=True)
@@ -724,15 +1154,23 @@ def main():
                     with gimbal_state_lock:
                         gp = gimbal_state["pitch"]
                         gy = gimbal_state["yaw"]
+                        firing_now = gimbal_state.get("firing", False)
+                        fire_elapsed = gimbal_state.get("fire_elapsed", 0.0)
                     if selected is not None:
                         (x1, y1), (x2, y2) = selected["bbox"]
                         tcx = int(round((x1 + x2) / 2.0))
                         tcy = int(round((y1 + y2) / 2.0))
-                        cv2.circle(frame, (tcx, tcy), 5, (0, 0, 255), -1)
-                        cv2.line(frame, (fx, fy), (tcx, tcy), (0, 0, 255), 2)
+                        primary = (0, 0, 255) if not firing_now else (0, 255, 0)
+                        cv2.circle(frame, (tcx, tcy), 5, primary, -1)
+                        cv2.line(frame, (fx, fy), (tcx, tcy), primary, 2)
                         cv2.putText(frame, f"yaw={gy:+.1f} pitch={gp:+.1f}",
                                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (0, 0, 255), 2, cv2.LINE_AA)
+                                    primary, 2, cv2.LINE_AA)
+                        if firing_now:
+                            fire_mode_tag = "LIVE" if args.live_fire else "BLANK"
+                            cv2.putText(frame, f"FIRING ({fire_mode_tag}) t={fire_elapsed:.2f}s",
+                                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                                        (0, 255, 0), 3, cv2.LINE_AA)
                     else:
                         cv2.putText(frame, f"NO_TARGET (hold yaw={gy:+.1f} pitch={gp:+.1f})",
                                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -754,6 +1192,12 @@ def main():
         print("\nStopping...", flush=True)
     finally:
         stop_event.set()
+        if not args.no_fire and master is not None:
+            try:
+                send_relay(master, args.fire_relay, 0)
+                print(f"[FIRE] safety: relay {args.fire_relay} forced OFF on exit", flush=True)
+            except Exception as e:
+                print(f"[FIRE] WARN: safety relay OFF failed on exit: {e}", flush=True)
         t_cap.join(timeout=2.0)
         t_inf.join(timeout=2.0)
         t_tx.join(timeout=2.0)

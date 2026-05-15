@@ -1,26 +1,64 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-14 — autonomous gimbal script working)
-**Last action:** Built `test/tf_live_inferenceV2_gimbal_auto.py` — a single production script combining V2's threaded inference, the simulation script's deadband+gain control law, and the manual-gimbal script's MAVLink connection/telemetry/transmit threading. User ran it end-to-end and confirmed it **works**. Quote: *"that script works amazingly. it just needs some logic tuning and gain control on the movement and mapping, but other than that its great."* Added a `--center-gimbal` early-exit mode that skips inference and just emits `MAV_CMD_DO_MOUNT_CONTROL(pitch=0, yaw=0)` for a configurable duration. Also installed `ailearn.sh` at repo root (was missing from this repo though present in sibling projects).
+## ⏸ WHERE WE LEFT OFF (2026-05-14 late — autonomous tracking + state-machine firing, both USER-VALIDATED)
 
-**What's left (next session):** tune `--yaw-gain` (default 12) and `--pitch-gain` (default 10) — they're heuristic, not FOV-calibrated. Possibly add FOV-based mapping (`pixel_err × HFOV/2 = deg_err`), gimbal feedback closed-loop via `MOUNT_STATUS`/`GIMBAL_DEVICE_ATTITUDE_STATUS`, or earth-frame stabilization. **User briefly asked about PWM-based centering then redirected to mapping discussion — PWM option still on the table.**
+**Two big subsystems converged this session, both confirmed working end-to-end on the Pi against the autopilot:**
 
-**Working artifacts on disk:**
-- `test/tf_live_inferenceV2_gimbal_auto.py` — new production script (this session).
-- `test/tf_live_inferenceV2.py` — prior V2 inference (still valid for inference-only deployments without gimbal).
-- `ailearn.sh` at repo root (added this session; copy of UAS_Competition_task_1_2026 version).
+### 1. Gimbal control law — slew-rate-limited proportional (final architecture)
+The integrator runaway diagnosed earlier in the day was fixed by **decoupling the controller from the transmitted setpoint via `GimbalLink`**:
+- Inference thread computes `wished_yaw = link.get_current() + yaw_gain * err_x` **fresh every frame** (NOT integrated). The reference is the actual transmitted position, not a free-running counter.
+- TX thread (20 Hz) ramps `current_yaw` toward `wished_yaw` by at most `max_slew_rate_yaw / 20` degrees per tick. Hard rate-limit. Gimbal can never be commanded faster than its physical slew can keep up with.
+- Per-frame log carries both `cur=(y,p)` (transmitted, what gimbal sees) and `wished=(y,p)` (controller intent, leads by `gain * err`).
+- Defaults: `--yaw-gain 12`, `--pitch-gain 10` (sim values, unchanged), `--max-slew-rate-yaw 2.0`, `--max-slew-rate-pitch 1.5` (deg/sec).
+- New `--start-from-current` flag: reads `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` via `read_current_gimbal_position()` and starts the controller from the gimbal's actual orientation. Without the flag, the script centers the gimbal first.
 
-**Pi commands**:
+### 2. Fire control — phase state machine driven by RELAY_STATUS confirmation (final architecture)
+After iterating through many false starts (DO_REPEAT_RELAY with double-send, DO_SET_RELAY ON+timer+OFF, idle heartbeats, blind keepalive), we landed on:
+- **Five-phase state machine**: `IDLE → ARMING → FIRING → DISARMING → COOLDOWN → IDLE`.
+- **No phase advance without `RELAY_STATUS` confirmation** for ARMING→FIRING (waits for bit=1) and DISARMING→COOLDOWN (waits for bit=0). FIRING→DISARMING and COOLDOWN→IDLE are time-based.
+- **2 Hz keepalive** in every phase sends `DO_SET_RELAY` with the desired state. Idempotent. Single-packet loss can't strand the relay in the wrong state for more than ~500 ms.
+- **`RELAY_STATUS` (msg 376)** subscribed at 5 Hz via `MAV_CMD_SET_MESSAGE_INTERVAL` (511) at MAVLink connect. ArduPilot's relay bits are 0-indexed; gun is relay **1** (matches QGC "Shoot Gun" action's `param1=1`).
+- **`fire_period` timer starts on confirmed ON** (not on send), so 5 s burst is exactly 5 s ON from autopilot's perspective. Same for `fire_cooldown` after confirmed OFF.
+- BLANK mode (`--live-fire` absent) auto-confirms phase transitions after 100 ms simulated lag for testing.
+
+### Key learnings from the long debugging arc (don't repeat)
+- **`MAV_CMD_DO_REPEAT_RELAY` (182) with `cycles=1, period=N`** does **N/2 seconds ON, N/2 seconds OFF** in ArduPilot. NOT "ON for N seconds". `period=5` gave us 2.5 s ON — wrong tool for "fire for X seconds" requirements.
+- **Double-sending `DO_REPEAT_RELAY` (50 ms apart)** caused on/off/on/off chatter — each command starts its own relay-pulse state machine in the autopilot, and concurrent state machines collide. **Single-send only** for that command.
+- **Sending `DO_SET_RELAY` OFF while a `DO_REPEAT_RELAY` cycle is in progress** interrupts the cycle. Mixing these commands is brittle. Pick one mechanism and stick with it.
+- The right primitive for "script controls the on-time" is **`DO_SET_RELAY` (181) ON, wait, `DO_SET_RELAY` OFF**. The autopilot just holds state; the script owns timing.
+- **QGroundControl's "Shoot Gun" action** is `cmd=182 param1=1 param2=1 param3=2` — relay 1, 1 cycle of 2 s = 1 s pulse. Verified by user.
+- **The user's autopilot publishes `RELAY_STATUS`** and our `SET_MESSAGE_INTERVAL` request works — confirmed at runtime.
+
+### Working artifacts on disk
+- `test/tf_live_inferenceV2_gimbal_auto.py` — autonomous tracking + state-machine firing (FINAL — user-confirmed working).
+- `test/manual_gimbal_control.py` — `--live-fire` is now a one-shot fire-and-exit (parallel to `--center-gimbal`). Press `f` in panel mode for BLANK simulation; pass `--live-fire` as a CLI arg for real one-shot fire. Used as the isolation harness that confirmed the autopilot's relay control.
+
+### Pi commands (current production)
 ```bash
-# Live autonomous gimbal tracking (production)
-python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output --mavlink tcp:10.42.0.1:5760
+# Autonomous tracking + autonomous firing (live)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current --live-fire
 
-# Bench dry-run (no autopilot)
-python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output --no-mavlink
+# Autonomous tracking only (no fire commands sent — BLANK simulation in logs)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current
 
-# Center gimbal and exit (no model/camera needed)
-python3 -B tf_live_inferenceV2_gimbal_auto.py --center-gimbal --mavlink tcp:10.42.0.1:5760
+# Autonomous tracking, no fire logic at all (camera/gimbal only)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current --no-fire
+
+# Manual one-shot fire test (NO panel, NO key handler)
+python3 ~/manual_gimbal_control.py --live-fire
+
+# Manual gimbal panel (BLANK fire simulation only — 'f' key logs but doesn't fire)
+python3 ~/manual_gimbal_control.py
 ```
+
+### Tuning knobs (defaults work as starting points)
+- `--max-slew-rate-yaw 2.0 --max-slew-rate-pitch 1.5` (deg/sec) — controls gimbal slew. Lower = smoother but slower convergence; raise to 5-10 for faster tracking if the physical gimbal can keep up.
+- `--fire-period 5.0` — seconds the relay is held ON per burst.
+- `--fire-cooldown 0.5` — seconds of forced OFF between back-to-back bursts (set to 0 to disable auto-repeat — one-shot per centering event, requires un-center to re-arm).
+- `--fire-relay 1` — relay instance (matches QGC config).
 
 Output shape `(1, 5, 8400)` is INTENTIONAL — see `feedback_hash_not_shape` memory before assuming the wrong model is loaded.
 

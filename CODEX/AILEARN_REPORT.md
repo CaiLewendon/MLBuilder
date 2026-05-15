@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-14 01:00:48 PDT
+Generated: 2026-05-14 23:02:51 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,10 +21,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                2d6e4f4663c229f71cb41e0af204001e93330a28 [ahead 2] run it with out sending video --no-output
+* cPCcputestinglocally                0cadeec95f8887d4d9a450a1bf555a8f7f1b21af Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally 1fdd0c2f80e9835cfc5ee0cd48266223331ec2e5 documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
+  remotes/origin/cPCcputestinglocally 0cadeec95f8887d4d9a450a1bf555a8f7f1b21af Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
   remotes/origin/cTPUtest             714f8c78346f8d84aa6cb8d9d252e1a034af4e24 divyesh is financially iliterate
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
@@ -33,15 +33,13 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Status
 
 ```text
-## cPCcputestinglocally...origin/cPCcputestinglocally [ahead 2]
+## cPCcputestinglocally...origin/cPCcputestinglocally
  M CLAUDE.md
- M CODEX.md
  M CODEX/AILEARN_REPORT.md
  M CONTEXT.md
- M HANDOFF.md
  M KANBAN.md
-?? ailearn.sh
-?? test/tf_live_inferenceV2_gimbal_auto.py
+ M test/manual_gimbal_control.py
+ M test/tf_live_inferenceV2_gimbal_auto.py
 
 ```
 
@@ -8193,6 +8191,7 @@ test/manual_gimbal_control.py
 test/pi_mavlink_fullsuite_test.py
 test/prepare_dataset_split.py
 test/__pycache__
+test/__pycache__/manual_gimbal_control.cpython-312.pyc
 test/__pycache__/pi_mavlink_fullsuite_test.cpython-312.pyc
 test/__pycache__/rebuild_tpu_model_pi.cpython-312.pyc
 test/__pycache__/tf_inference_data_live.cpython-312.pyc
@@ -126041,7 +126040,6 @@ ef719ce | 2026-05-02 |  | it works hell yea
 9d7c719 | 2026-05-10 |  | added drone movement and alt/ort hold and alignment
 2bb74a2 | 2026-05-10 |  | added mavlink test suite script
 1105e25 | 2026-05-10 |  | updated test suite
-1fdd0c2 | 2026-05-12 |  (origin/cPCcputestinglocally) | documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
-f89d8b7 | 2026-05-13 |  | continue compiling tflite files they are almost done
-2d6e4f4 | 2026-05-13 |  (HEAD -> cPCcputestinglocally) | run it with out sending video --no-output
+1fdd0c2 | 2026-05-12 |  | documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
+0cadeec | 2026-05-14 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
 ```

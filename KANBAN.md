@@ -1,5 +1,46 @@
 # Kanban
 
+## Done (2026-05-14 late — slew-rate-limited tracking + state-machine firing, USER-VALIDATED on real hardware)
+
+### Gimbal control law (final architecture — replaces the cumulative-P integrator)
+- **Two-tier control via `GimbalLink`**:
+  - Inference thread computes `wished_yaw = link.get_current() + yaw_gain * err_x` fresh every frame (NOT integrated). Reference is actual transmitted position.
+  - TX thread (20 Hz) ramps the transmitted `current_yaw` toward `wished_yaw` at `max_slew_rate_yaw / 20` deg per tick. Hard rate limit.
+- New `GimbalLink` methods: `set_wished()`, `get_current()`, `get_wished()`. `run_tx_loop` now does the rate-limited ramping and transmits each tick.
+- **CLI flags added**: `--max-slew-rate-yaw 2.0`, `--max-slew-rate-pitch 1.5` (deg/sec). Conservative micro-stepping (0.10°/0.075° per tick at 20 Hz). Sim-equivalent `--yaw-gain 12 / --pitch-gain 10` retained.
+- **`--start-from-current` flag**: at startup, reads `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` via new `read_current_gimbal_position()` helper. Uses autopilot-reported gimbal orientation as the initial reference. Without the flag the script centers the gimbal first via existing `center_gimbal()`.
+- **Confirmed**: user observed smooth convergence without overshoot at `2.0/1.5 deg/sec`; `--start-from-current` correctly read `pitch=+37.71 yaw=+1.13` from the user's gimbal and tracked from that reference.
+- **Per-frame log** now shows both `cur=(y,p)` (transmitted, actual gimbal) and `wished=(y,p)` (controller intent).
+
+### Fire control — phase state machine with RELAY_STATUS confirmation (final architecture)
+- **Five phases**: `IDLE → ARMING → FIRING → DISARMING → COOLDOWN → IDLE`. Transitions ARMING→FIRING and DISARMING→COOLDOWN require `RELAY_STATUS` confirmation from autopilot. FIRING→DISARMING and COOLDOWN→IDLE are time-based.
+- **2 Hz keepalive** in every phase: continuously reasserts the target relay state via `DO_SET_RELAY`. Idempotent. Single-packet loss recovers within ~500 ms.
+- **`MAV_CMD_SET_MESSAGE_INTERVAL` (511)** sent on connect to subscribe `RELAY_STATUS` (msg 376) at 5 Hz. `GimbalLink` captures the latest `on` / `present` bitmasks in `run_rx_loop`; `link.get_relay_status()` exposes them to the fire state machine.
+- **`fire_period` timer starts on confirmed ON**, not on send. `fire_cooldown` timer starts on confirmed OFF. So "5-second burst" means exactly 5 s of confirmed ON.
+- **CLI flags**:
+  - `--live-fire`: real `DO_SET_RELAY` commands. Default is BLANK (logs phase transitions, no real fire).
+  - `--no-fire`: disables fire logic entirely.
+  - `--fire-relay 1`: matches QGC "Shoot Gun" action's `param1=1`.
+  - `--fire-period 5.0`: seconds ON per burst.
+  - `--fire-cooldown 0.5`: seconds OFF between back-to-back bursts. Set to 0 for one-shot-per-lock.
+- **Abort path**: target leaves CENTERED during ARMING → drop to DISARMING (turn relay off before it actually fired). FIRING is *not* aborted on target loss — burst runs to completion.
+- **Exit safety**: `finally` block always sends `DO_SET_RELAY` OFF on Ctrl-C / crash / normal exit.
+- **Confirmed**: full IDLE→ARMING→FIRING→DISARMING→COOLDOWN cycle worked end-to-end on the user's autopilot. User explicitly approved: *"that worked"*.
+
+### Manual gimbal control script — `--live-fire` re-purposed as one-shot CLI action
+- `python3 manual_gimbal_control.py --live-fire` now: connect → send ONE `MAV_CMD_DO_REPEAT_RELAY` (`param1=1 param2=1 param3=2`, matching QGC "Shoot Gun" byte-for-byte) → wait up to 2.5 s for `COMMAND_ACK` → log result code → exit.
+- No panel, no keyboard handler, no concurrent threads. Single linear code path.
+- Used as the **isolation harness** that proved the relay command works when issued from a non-interactive context — confirmed firing on a single CLI invocation.
+- Interactive panel (without `--live-fire`) still works for gimbal positioning; `f` key now simulates fire in BLANK only.
+
+### Things tried and abandoned this session (for posterity)
+- Per-frame step clamp + lock-and-hold state machine — reverted. Treated symptoms not root cause.
+- Tiny gains (`--yaw-gain 0.5 / --pitch-gain 0.4`) cumulative-P — too slow, still overshot.
+- Settle-delay between corrections — "messed up processing" per user.
+- `DO_REPEAT_RELAY` double-send — caused on/off/on/off chatter from overlapping autopilot state machines.
+- `DO_SET_RELAY` ON+timer+OFF with blind 2 Hz keepalive (no RELAY_STATUS check) — worked but no truth confirmation.
+- Closed-loop mismatch correction without phase gating — risked corrective commands interfering with in-progress autopilot cycles.
+
 ## Done
 - Established Pi + Coral inference bring-up end-to-end.
 - Confirmed correct model artifact for TPU deployment.
@@ -48,12 +89,20 @@
   - User confirmed: "that script works amazingly. it just needs some logic tuning and gain control on the movement and mapping, but other than that its great"
 - **`ailearn.sh` installed at repo root** (was missing; copied canonical version from sibling project)
 
-## In Progress (2026-05-14)
-- **Gimbal control law tuning** (open, scope clarified by user)
-  - Tune `--yaw-gain` (default 12) and `--pitch-gain` (default 10) for the actual camera + gimbal response. Today's defaults are heuristics, not FOV-calibrated.
-  - Consider FOV-aware mapping: `deg_err = pixel_err × HFOV/2`. If `yaw_gain ≈ HFOV/2` ≈ 30° for a ~60° HFOV camera, the controller becomes near-deadbeat (1-frame settle), but stability margin shrinks.
-  - Consider gimbal feedback closed-loop: compare commanded vs `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` reading.
-  - Open decision: PWM-based centering fallback (`MAV_CMD_DO_SET_SERVO`, cmd 183) — user asked about this then redirected. Channels + neutral PWM values not yet captured.
+## Done (2026-05-14 — overshoot fix + lock-and-hold)
+- **Per-frame motion cap** added to `tf_live_inferenceV2_gimbal_auto.py` control law. New flags `--max-yaw-step` (default 2.0°) and `--max-pitch-step` (default 1.5°) clamp `gain*err` so a large pixel error cannot issue an oversized angle command and overshoot. Below the saturation point (`|err_x| < 0.166` at default gains) response is still fully proportional; above it, the step is capped.
+- **Lock-and-hold state machine** added with `--lock-frames` (default 5) and `--shoot-duration` (default 3.0 s). State transitions:
+  - `TRACKING` → in-deadband counter increments each centered frame; at `lock_frames` consecutive in-deadband frames, → `LOCKED`.
+  - `LOCKED` ("SHOOTING") → tracking continues **even inside deadband** (corrects wind/drift); `LOCK_LOST_DRIFT` if target leaves deadband; `SHOOT_DONE` after `shoot_duration` seconds → back to `TRACKING` (counter reset).
+  - Lost target → `LOCK_LOST_NO_TARGET`, drop to `TRACKING`.
+- Per-frame log line now carries `state=`, `lock=N/N` or `t=X.XX/Y.YY s`, and `step=(y±X.XX,p±X.XX)`. Overlay shows shooting state in green; cross-hair line + bbox circle turn green during `LOCKED`.
+
+## In Progress (2026-05-14 late — post-state-machine-confirmation)
+- **Tune slew rates against actual gimbal hardware** — defaults `--max-slew-rate-yaw 2.0 / --max-slew-rate-pitch 1.5 (deg/sec)` are conservative micro-stepping. Confirmed smooth without overshoot. Next: if smoothness is good, raise toward `5-10 deg/sec` for faster target re-acquisition. The gain itself (`yaw_gain=12 / pitch_gain=10`, same as simulation) does not need to change — slew rate is the right tuning knob now.
+- **Tune `fire_period` and `fire_cooldown` for mission requirements** — default 5 s ON, 0.5 s OFF gives ~5 s fire / 0.5 s rest auto-repeat while centered. Adjust to match the operational requirement (suppressive bursts vs single-shot precision, etc.). Set `--fire-cooldown 0` for one-shot-per-lock semantics.
+- **FOV-aware control mapping** — for deadbeat tracking, `yaw_gain ≈ HFOV/2`, `pitch_gain ≈ VFOV/2`. HFOV/VFOV of the actual camera still not captured. With slew rate limiting, this is now lower-priority — the rate limit makes overshoot impossible even if gain is wrong.
+- **Gimbal closed-loop feedback (open-loop today)** — `MOUNT_STATUS` and `GIMBAL_DEVICE_ATTITUDE_STATUS` are ingested by `run_rx_loop` but only used at startup for `--start-from-current`. Could compare commanded `current_yaw` vs reported attitude during operation to detect mechanical lag or failure.
+- **PWM fallback** — open from prior session. `MAV_CMD_DO_SET_SERVO` cmd 183 channels and neutral PWM values not yet captured. Low priority since `DO_MOUNT_CONTROL` works.
 - **Architecture decision for live inference deployment on Pi** (2026-05-13 evening — still open)
   - Confirmed via `--no-output` test: the **video output stream** (raw 1080p over UDP via `rtpvrawpay`) is the choke point on the Pi when inference is running, NOT inference itself, NOT the camera, NOT the decoder. With `--no-output`, inference runs steady at ~7 fps with no multi-second gaps. With output enabled at 1080p/raw, capture rate collapses to ~1 fps causing 7-second stalls in detections.
   - Inference ceiling on Pi: ~140 ms/cycle = **7 fps max sustained** (60% of FullDataSetProd ops fall back to CPU per compile log: 132 on TPU / 211 on CPU). Hardware floor short of re-exporting at smaller `imgsz`.

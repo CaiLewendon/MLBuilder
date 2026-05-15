@@ -469,3 +469,95 @@ Skips camera/TFLite/threading entirely. Connects MAVLink, sends `(pitch=0, yaw=0
 - **Gimbal feedback** — currently open-loop on MAVLink ACK only. `MOUNT_STATUS` and `GIMBAL_DEVICE_ATTITUDE_STATUS` are received and logged by `run_rx_loop` but not used for closed-loop verification.
 - **PWM fallback** — user asked about `MAV_CMD_DO_SET_SERVO`-based centering, then redirected. Pitch/yaw servo channels and neutral PWM values not yet captured.
 - **Earth-frame stabilization** — not compensating airframe roll/pitch from `ATTITUDE`. Body-frame only.
+
+---
+
+## 2026-05-14 Late Session Addendum (Slew-rate-limited control + state-machine firing)
+
+### Gimbal control law — final architecture (replaces earlier "cumulative-P" snapshot above)
+The cumulative-P integrator (`current_yaw += yaw_gain * err_x`) was diagnosed as the root cause of overshoot on real hardware. Cumulative additions outran the physical gimbal slew rate; by the time the gimbal had moved a few degrees, the integrator had commanded tens of degrees ahead. The fix is a **two-tier control system** owned by `GimbalLink`:
+
+| Tier | Owned by | Update rate | What it does |
+|---|---|---|---|
+| **Controller** (`wished_yaw/pitch`) | inference thread | ~5 Hz (per detection) | `wished_yaw = link.get_current() + yaw_gain * err_x` — computed FRESH each frame against the actual transmitted position. NOT integrated. |
+| **Transmitter** (`current_yaw/pitch`) | `run_tx_loop` in GimbalLink | 20 Hz | Each tick, step `current_*` toward `wished_*` by at most `max_slew_rate_* / 20` degrees. Hard rate limit. Transmits the (slowly-moving) `current_*` via `MAV_CMD_DO_MOUNT_CONTROL`. |
+
+Because inference reads `current_yaw` (the slow-moving transmitted value) to compute `wished_yaw`, the integrator naturally stops growing as the gimbal physically moves and `err_x` shrinks. Standard proportional-against-actual control with a slew-rate-limited setpoint. No accumulation, no runaway.
+
+**Defaults (CLI args):**
+- `--yaw-gain 12.0`, `--pitch-gain 10.0` — same as simulation script (intentional; we want sim-equivalent gain).
+- `--max-slew-rate-yaw 2.0`, `--max-slew-rate-pitch 1.5` (deg/sec) — conservative, micro-stepping at 20 Hz: 0.10° / 0.075° per tick. Convergence on a 30° world-angle error takes ~15 s. Raise for faster tracking when gimbal slew capability is known.
+- `--deadband 0.08` — unchanged.
+
+**Per-frame log carries both setpoints:**
+```
+[F0001] target_bbox=((735,330),(1155,780)) center=(945,555) err=(-0.016,+0.028)
+  conf=0.918 dir=CENTERED cur=(y+1.13,p+37.71) wished=(y+1.13,p+37.71)
+  fire_phase=IDLE CMD_LONG cmd=205 param1=37.71 ...
+```
+`cur` = where the gimbal physically is (transmitted). `wished` = controller intent. They converge when err→0.
+
+### Startup orientation
+- **Default**: script centers the gimbal first by calling `center_gimbal()` (sends `(0,0)` for `center_duration` × `center_rate` packets), then begins tracking from `(0,0)`.
+- **`--start-from-current`**: script reads `MOUNT_STATUS` or `GIMBAL_DEVICE_ATTITUDE_STATUS` from the autopilot for up to `--read-current-timeout` seconds via `read_current_gimbal_position()` and uses the reported angles as the initial reference. Gimbal does not move on startup. Aborts cleanly if no message received in time. **Confirmed working** — user's gimbal reported `pitch=+37.71 yaw=+1.13` and tracking continued smoothly from that reference.
+
+### Fire control — final architecture
+Phase state machine, **`RELAY_STATUS`-confirmed transitions**. Replaces all earlier attempts (DO_REPEAT_RELAY double-send, DO_SET_RELAY ON+timer+OFF, idle heartbeats, blind keepalive, closed-loop verify).
+
+**Phases:**
+- `IDLE`: relay confirmed OFF (or not-yet-fired). Waiting for CENTERED target. 2 Hz `DO_SET_RELAY OFF` keepalive.
+- `ARMING`: sent `DO_SET_RELAY ON`. 2 Hz reassertion. Transitions to FIRING only when `RELAY_STATUS` reports relay bit = 1.
+- `FIRING`: relay confirmed ON. Timer counts `fire_period` seconds from confirmed-ON instant. Continued 2 Hz `DO_SET_RELAY ON` reassertion in case of mid-burst dropouts.
+- `DISARMING`: sent `DO_SET_RELAY OFF`. 2 Hz reassertion. Transitions to COOLDOWN only when `RELAY_STATUS` reports relay bit = 0.
+- `COOLDOWN`: relay confirmed OFF. `fire_cooldown` seconds idle gap. 2 Hz `DO_SET_RELAY OFF` reassertion. Returns to IDLE when timer expires, resetting `lock_fired`.
+
+**Commands used:**
+- `MAV_CMD_DO_SET_RELAY` (181) for the state changes. Idempotent — sending ON when already ON does nothing; sending OFF when already OFF does nothing.
+- `MAV_CMD_SET_MESSAGE_INTERVAL` (511) on connect to subscribe `RELAY_STATUS` (msg 376) at 5 Hz.
+- `MAV_CMD_DO_MOUNT_CONTROL` (205) for gimbal — unchanged.
+- `MAV_CMD_DO_REPEAT_RELAY` (182) is defined and `send_repeat_relay()` exists but is **not called** by the autonomous fire path anymore (used only in `manual_gimbal_control.py --live-fire` one-shot).
+
+**Fire CLI flags:**
+- `--live-fire` — actually send real `DO_SET_RELAY` commands. Without this, runs in BLANK mode (logs phase transitions, no real fire).
+- `--no-fire` — disables fire logic entirely (no logs, no commands).
+- `--fire-relay 1` — relay instance. Matches QGroundControl "Shoot Gun" action default.
+- `--fire-period 5.0` — seconds ON per burst.
+- `--fire-cooldown 0.5` — seconds OFF between back-to-back bursts (auto-repeat). Set to 0 for one-shot-per-lock (must un-center to re-fire).
+
+**Phase visible in every per-frame log:** `fire_phase=IDLE|ARMING|FIRING|DISARMING|COOLDOWN`.
+
+**Phase-transition logs (one per transition):**
+```
+[LIVE ARMING] sent DO_SET_RELAY(1,1); awaiting RELAY_STATUS confirmation that bit[1]=1
+[LIVE FIRE ON CONFIRMED] RELAY_STATUS confirmed after 0.34s; holding for 5.00s
+[LIVE BURST DONE] held ON for 5.01s; sent DO_SET_RELAY(1,0); awaiting OFF confirmation
+[LIVE FIRE OFF CONFIRMED] RELAY_STATUS confirmed after 0.12s; cooldown 0.50s before next burst
+[LIVE FIRE READY] cooldown complete; re-armed for next centering event
+```
+
+### Manual gimbal control script — `--live-fire` re-purposed as one-shot action
+`test/manual_gimbal_control.py --live-fire` now bypasses the interactive panel entirely:
+1. Connect MAVLink, wait heartbeat
+2. Send ONE `MAV_CMD_DO_REPEAT_RELAY` (matching QGC "Shoot Gun" action exactly: `param1=1 param2=1 param3=2`)
+3. Drain inbox up to ~2.5 s looking for `COMMAND_ACK` → print `[ACK] cmd=182 result=N`
+4. Close connection, exit
+
+This was the **isolation harness** that proved the relay command works correctly when issued from a single linear code path with no concurrent threads, no panel repaint loop, no keyboard auto-repeat. Confirmed firing on a single CLI invocation. Used as the validation step before trusting the same control flow inside the autonomous script.
+
+Interactive panel (without `--live-fire`): gimbal control + BLANK fire simulation only.
+
+### Confirmed during this session
+- Gimbal tracking with slew-rate limit converges smoothly without overshoot at `2.0/1.5 deg/sec` defaults on actual hardware.
+- `--start-from-current` correctly reads gimbal orientation from `MOUNT_STATUS` / `GIMBAL_DEVICE_ATTITUDE_STATUS` and starts tracking from that reference.
+- `DO_SET_RELAY` ON/OFF pattern fires the gun reliably (relay 1, gun trigger).
+- `RELAY_STATUS` is published by the autopilot when subscribed via `SET_MESSAGE_INTERVAL`.
+- Full autonomous loop: target detection → centered → ARMING → FIRING (5s) → DISARMING → COOLDOWN → ready for next centering event.
+- Exit safety always sends `DO_SET_RELAY OFF` in the `finally` block (cleanup on Ctrl-C, crash, normal exit).
+
+### Next session priorities
+1. **Tune `fire_period` and `fire_cooldown`** for the actual mission requirements (currently 5s fire / 0.5s rest).
+2. **Tune slew rates** — `2.0/1.5 deg/sec` is conservative. If smoothness is good, raise toward `5-10 deg/sec` for faster target re-acquisition.
+3. **Field test on airframe** — confirm tracking behavior in flight (vibration, attitude changes, lighting).
+4. **Decide on live-inference output choke** (open from prior session): `--no-output` works for autonomous-only; H.264 encoded relay or two-machine split needed if laptop viewer is required.
+5. **Consider FOV calibration** for deadbeat tracking (still open from prior session).
+6. **Earth-frame stabilization** (still open).
