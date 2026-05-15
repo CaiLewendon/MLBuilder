@@ -334,6 +334,11 @@ class GimbalLink:
         self._relay_present_mask = 0
         self._relay_status_time = None  # time.monotonic() of last update; None=never
 
+        # Latest COMMAND_ACK for DO_REPEAT_RELAY (cmd 182) captured by run_rx_loop.
+        # result codes: 0=ACCEPTED, 2=DENIED, 4=FAILED, 5=UNSUPPORTED, 6=IN_PROGRESS
+        self._last_repeat_relay_ack_result = None
+        self._last_repeat_relay_ack_time = None
+
     def get_relay_status(self):
         """Returns (on_mask, present_mask, age_seconds_or_None)."""
         with self._lock:
@@ -341,6 +346,12 @@ class GimbalLink:
                 return self._relay_on_mask, self._relay_present_mask, None
             return (self._relay_on_mask, self._relay_present_mask,
                     time.monotonic() - self._relay_status_time)
+
+    def get_last_repeat_relay_ack(self):
+        """Returns (result, monotonic_timestamp_or_None). result is None if no ACK
+        has ever been observed. Use to verify the autopilot accepted the command."""
+        with self._lock:
+            return self._last_repeat_relay_ack_result, self._last_repeat_relay_ack_time
 
     def set_wished(self, pitch: float, yaw: float) -> None:
         with self._lock:
@@ -428,6 +439,10 @@ class GimbalLink:
                     elif cmd == MAV_CMD_DO_SET_RELAY or cmd == MAV_CMD_DO_REPEAT_RELAY:
                         print(f"[ACK-RELAY] cmd={cmd} result={msg.result} "
                               f"(0=ACCEPTED, 4=FAILED, 2=DENIED, 5=UNSUPPORTED)", flush=True)
+                        if cmd == MAV_CMD_DO_REPEAT_RELAY:
+                            with self._lock:
+                                self._last_repeat_relay_ack_result = int(msg.result)
+                                self._last_repeat_relay_ack_time = time.monotonic()
                 except Exception:
                     pass
             elif t == "RELAY_STATUS":
@@ -632,21 +647,23 @@ def main():
                              "fire events nor send relay commands. Use for camera/gimbal-only "
                              "testing without any weapon engagement.")
     parser.add_argument("--live-fire", action="store_true",
-                        help="DANGEROUS. Send real MAV_CMD_DO_SET_RELAY ON/OFF commands. On each "
-                             "centering event the script sends ON, holds for --fire-period seconds, "
-                             "then sends OFF (3x for packet-loss safety). Without this flag the "
-                             "script runs in BLANK mode (logs only, no relay commands).")
+                        help="DANGEROUS. Send a real MAV_CMD_DO_REPEAT_RELAY per centering event. "
+                             "The autopilot pulses the relay ON for --fire-period seconds then "
+                             "auto-OFFs (cycle's second half is another --fire-period seconds idle). "
+                             "RELAY_STATUS gates each phase transition. Without this flag the script "
+                             "runs in BLANK mode (logs phase transitions, no relay commands).")
     parser.add_argument("--fire-relay", type=int, default=1,
-                        help="Relay instance for DO_SET_RELAY param1 (default: 1, matches the "
+                        help="Relay instance for DO_REPEAT_RELAY param1 (default: 1, matches the "
                              "QGroundControl 'Shoot Gun' relay).")
     parser.add_argument("--fire-period", type=float, default=5.0,
-                        help="Seconds the relay is held ON per burst. Script sends DO_SET_RELAY ON, "
-                             "waits this long, then sends DO_SET_RELAY OFF. Default 5.0.")
+                        help="Seconds the autopilot holds the relay ON per burst. The script sends "
+                             "DO_REPEAT_RELAY with cycles=1, period=2*fire_period; ArduPilot then "
+                             "auto-toggles relay ON for fire_period sec, then OFF for fire_period sec. "
+                             "Default 5.0 (= cycle_time 10s = 5s ON + 5s OFF).")
     parser.add_argument("--fire-cooldown", type=float, default=0.5,
-                        help="Seconds of forced OFF between back-to-back bursts. Default 0.5. "
-                             "Gives the autopilot's relay a clean idle window before the next ON. "
-                             "Set to 0 to disable auto-repeat entirely (fire only once per "
-                             "un-center -> re-center event).")
+                        help="Additional seconds of forced idle AFTER the autopilot's full cycle "
+                             "(2*fire_period) completes, before the next burst can be triggered. "
+                             "Default 0.5. Total time between fires = 2*fire_period + fire_cooldown.")
 
     args = parser.parse_args()
 
@@ -820,45 +837,34 @@ def main():
     }
     gimbal_state_lock = threading.Lock()
 
-    # Fire state machine driven by RELAY_STATUS confirmation.
+    # Fire state machine — DO_REPEAT_RELAY (cmd 182) with COMMAND_ACK gating.
     #
-    #   IDLE      → relay confirmed OFF. Waiting for CENTERED target.
-    #   ARMING    → sent DO_SET_RELAY ON. Resending at 2 Hz keepalive.
-    #               Transitions to FIRING when RELAY_STATUS reports relay = ON.
-    #   FIRING    → relay confirmed ON. Holding for fire_period seconds.
-    #               Continues 2 Hz ON reassertion in case of mid-burst dropouts.
-    #   DISARMING → sent DO_SET_RELAY OFF. Resending at 2 Hz keepalive.
-    #               Transitions to COOLDOWN when RELAY_STATUS reports relay = OFF.
-    #   COOLDOWN  → relay confirmed OFF. Idle gap of fire_cooldown seconds.
-    #               2 Hz OFF reassertion. Transitions back to IDLE when expired.
+    #   IDLE    → wait for CENTERED. On entry: send ONE DO_REPEAT_RELAY → ARMING.
+    #   ARMING  → wait for COMMAND_ACK for cmd=182. The autopilot ACKs commands
+    #             it accepts within ~100ms regardless of relay timing, so this
+    #             is a reliable confirmation (unlike RELAY_STATUS which may not
+    #             show intermediate ON state during a 1-cycle DO_REPEAT_RELAY).
+    #               result=0  → ACCEPTED → FIRING
+    #               result≠0  → REJECTED → IDLE (log error)
+    #               timeout   → ACK lost → FIRING (proceed, assume command got through)
+    #   FIRING  → autopilot is pulsing the relay. Timer-based for fire_period sec.
+    #             RELAY_STATUS read for log visibility only.
+    #   COOLDOWN→ wait until autopilot's full cycle (2*fire_period from send)
+    #             completes plus fire_cooldown; ensures next DO_REPEAT_RELAY can't
+    #             collide with an in-progress cycle.
     #
-    # Every transition that depends on physical relay state requires RELAY_STATUS
-    # confirmation from the autopilot. Time-based transitions (FIRING duration,
-    # COOLDOWN duration) advance on the clock. BLANK mode (--live-fire absent)
-    # auto-confirms after a short simulated lag for testing without firing.
+    # MAVLink traffic per fire: exactly ONE DO_REPEAT_RELAY out, one COMMAND_ACK in.
+    # Plus the inbound RELAY_STATUS stream (autopilot publishes at 5 Hz, we just listen).
     fire_burst_duration = float(args.fire_period)
-    fire_keepalive_interval = 0.5  # 2 Hz reassertion of the current target relay state
-    fire_blank_sim_lag = 0.1       # in BLANK mode, simulated RELAY_STATUS confirmation delay
+    fire_cycle_time = 2.0 * float(args.fire_period)  # DO_REPEAT_RELAY param3
+    fire_arm_ack_timeout = 1.0  # max time to wait for COMMAND_ACK before assuming lost
     fire_state = {
         "phase": "IDLE",
-        "phase_start_time": time.monotonic(),
-        "last_send": 0.0,
-        "lock_fired": False,
+        "fire_send_time": 0.0,
     }
-
-    def _phase_target_on() -> int:
-        return 1 if fire_state["phase"] in ("ARMING", "FIRING") else 0
-
-    def _send_relay_safe(state_value: int) -> None:
-        if args.live_fire and master is not None:
-            try:
-                send_relay(master, args.fire_relay, state_value)
-            except Exception as e:
-                print(f"[FIRE ERROR] DO_SET_RELAY({state_value}) failed: {e}", flush=True)
 
     def _enter_phase(new_phase: str, log: str) -> None:
         fire_state["phase"] = new_phase
-        fire_state["phase_start_time"] = time.monotonic()
         print(log, flush=True)
 
     def fire_advance(centered: bool):
@@ -866,80 +872,92 @@ def main():
         if args.no_fire:
             return
         now = time.monotonic()
+        phase = fire_state["phase"]
+        mode = "LIVE" if args.live_fire else "BLANK"
 
-        # Read autopilot-reported relay state (if available and fresh).
+        # RELAY_STATUS read for log visibility only.
         on_mask, _, status_age = link.get_relay_status()
         have_fresh_status = status_age is not None and status_age < 2.0
         actual_on = ((on_mask >> args.fire_relay) & 1) if have_fresh_status else None
-
-        # 2 Hz keepalive: continuously reassert the desired relay state. Idempotent.
-        target_on = _phase_target_on()
-        if (now - fire_state["last_send"]) >= fire_keepalive_interval:
-            _send_relay_safe(target_on)
-            fire_state["last_send"] = now
-
-        phase = fire_state["phase"]
-        elapsed_phase = now - fire_state["phase_start_time"]
-        mode = "LIVE" if args.live_fire else "BLANK"
+        relay_tag = f"RELAY[{args.fire_relay}]={'ON' if actual_on == 1 else 'OFF' if actual_on == 0 else '?'}"
 
         if phase == "IDLE":
-            if centered and not fire_state["lock_fired"]:
-                fire_state["lock_fired"] = True
-                _send_relay_safe(1)
-                fire_state["last_send"] = now
+            if centered:
+                fire_state["fire_send_time"] = now
+                if args.live_fire and master is not None:
+                    try:
+                        send_repeat_relay(master, args.fire_relay, 1, fire_cycle_time)
+                    except Exception as e:
+                        print(f"[FIRE ERROR] DO_REPEAT_RELAY failed: {e}", flush=True)
+                        return
                 _enter_phase(
                     "ARMING",
-                    f"[{mode} ARMING] sent DO_SET_RELAY({args.fire_relay},1); "
-                    f"awaiting RELAY_STATUS confirmation that bit[{args.fire_relay}]=1",
+                    f"[{mode} ARMING] sent DO_REPEAT_RELAY({args.fire_relay},cycles=1,"
+                    f"period={fire_cycle_time:.2f}s); awaiting COMMAND_ACK for cmd=182",
                 )
 
         elif phase == "ARMING":
-            confirmed_on = (have_fresh_status and actual_on == 1)
-            blank_sim_ok = (not args.live_fire) and elapsed_phase >= fire_blank_sim_lag
-            if not centered:
-                # Target lost before fire actually started — abort to OFF.
-                _send_relay_safe(0)
-                fire_state["last_send"] = now
-                _enter_phase(
-                    "DISARMING",
-                    f"[FIRE ABORT] target lost before ARMING confirmed; "
-                    f"sent DO_SET_RELAY({args.fire_relay},0); awaiting OFF confirmation",
-                )
-            elif confirmed_on or blank_sim_ok:
-                conf_tag = "RELAY_STATUS confirmed" if confirmed_on else "BLANK simulated"
+            elapsed = now - fire_state["fire_send_time"]
+            # BLANK mode auto-confirms after a tick so the state machine progresses
+            # without real MAVLink traffic.
+            if not args.live_fire:
+                if elapsed >= 0.1:
+                    _enter_phase(
+                        "FIRING",
+                        f"[{mode} ARMED] BLANK simulated ACK after {elapsed:.2f}s; "
+                        f"autopilot would pulse relay ON for ~{fire_burst_duration:.2f}s",
+                    )
+                return
+            # Check for an ACK that arrived after we sent.
+            ack_result, ack_time = link.get_last_repeat_relay_ack()
+            ack_is_for_our_send = (
+                ack_time is not None and ack_time >= fire_state["fire_send_time"]
+            )
+            if ack_is_for_our_send:
+                if ack_result == 0:
+                    _enter_phase(
+                        "FIRING",
+                        f"[{mode} ARMED] COMMAND_ACK result=0 (ACCEPTED) after "
+                        f"{elapsed:.2f}s; autopilot will pulse relay ON for "
+                        f"~{fire_burst_duration:.2f}s",
+                    )
+                else:
+                    # Rejected — abort. Don't enter COOLDOWN because the autopilot
+                    # didn't start a cycle, so there's nothing to wait for.
+                    _enter_phase(
+                        "IDLE",
+                        f"[{mode} ARMING REJECTED] COMMAND_ACK result={ack_result} "
+                        f"(2=DENIED, 4=FAILED, 5=UNSUPPORTED) after {elapsed:.2f}s; "
+                        f"NOT firing; back to IDLE",
+                    )
+            elif elapsed >= fire_arm_ack_timeout:
+                # No ACK arrived within the timeout. The packet may have been lost,
+                # or the ACK may have been lost. Either way, proceed to FIRING and
+                # let the timer/COOLDOWN handle it. Log a warning so the user notices.
                 _enter_phase(
                     "FIRING",
-                    f"[{mode} FIRE ON CONFIRMED] {conf_tag} after {elapsed_phase:.2f}s; "
-                    f"holding for {fire_burst_duration:.2f}s",
+                    f"[{mode} ARMED WARN] no COMMAND_ACK in {fire_arm_ack_timeout:.2f}s; "
+                    f"assuming command got through (ACK may have been lost). "
+                    f"If no fire occurred, autopilot may have rejected silently.",
                 )
 
         elif phase == "FIRING":
-            if elapsed_phase >= fire_burst_duration:
-                _send_relay_safe(0)
-                fire_state["last_send"] = now
-                _enter_phase(
-                    "DISARMING",
-                    f"[{mode} BURST DONE] held ON for {elapsed_phase:.2f}s; "
-                    f"sent DO_SET_RELAY({args.fire_relay},0); awaiting OFF confirmation",
-                )
-
-        elif phase == "DISARMING":
-            confirmed_off = (have_fresh_status and actual_on == 0)
-            blank_sim_ok = (not args.live_fire) and elapsed_phase >= fire_blank_sim_lag
-            if confirmed_off or blank_sim_ok:
-                conf_tag = "RELAY_STATUS confirmed" if confirmed_off else "BLANK simulated"
+            elapsed = now - fire_state["fire_send_time"]
+            if elapsed >= fire_burst_duration:
                 _enter_phase(
                     "COOLDOWN",
-                    f"[{mode} FIRE OFF CONFIRMED] {conf_tag} after {elapsed_phase:.2f}s; "
-                    f"cooldown {args.fire_cooldown:.2f}s before next burst",
+                    f"[{mode} BURST DONE] {fire_burst_duration:.2f}s ON elapsed; "
+                    f"{relay_tag}; awaiting cycle completion + {args.fire_cooldown:.2f}s cooldown",
                 )
 
         elif phase == "COOLDOWN":
-            if elapsed_phase >= float(args.fire_cooldown):
-                fire_state["lock_fired"] = False
+            elapsed = now - fire_state["fire_send_time"]
+            ready_at = fire_cycle_time + float(args.fire_cooldown)
+            if elapsed >= ready_at:
                 _enter_phase(
                     "IDLE",
-                    f"[{mode} FIRE READY] cooldown complete; re-armed for next centering event",
+                    f"[{mode} FIRE READY] cycle ({fire_cycle_time:.2f}s) + cooldown "
+                    f"({args.fire_cooldown:.2f}s) complete; {relay_tag}; re-armed",
                 )
 
     def capture_thread():
@@ -1040,12 +1058,12 @@ def main():
                 else:
                     wished_pitch, wished_yaw = link.get_wished()
 
-                # Drive the fire state machine — gated on centered + RELAY_STATUS confirmation.
+                # Drive the fire state machine — simple 3-phase timer-driven.
                 fire_advance(centered=(move_label == "CENTERED"))
 
                 phase = fire_state["phase"]
                 is_firing = (phase == "FIRING")
-                fire_elapsed = (time.monotonic() - fire_state["phase_start_time"]) if is_firing else 0.0
+                fire_elapsed = (time.monotonic() - fire_state["fire_send_time"]) if is_firing else 0.0
 
                 with gimbal_state_lock:
                     gimbal_state["pitch"] = cur_pitch
@@ -1077,14 +1095,14 @@ def main():
                 )
             else:
                 cur_pitch, cur_yaw = link.get_current()
-                # Lost target — drive the state machine with centered=False so any
-                # in-progress ARMING aborts (sends OFF, waits for OFF confirmation).
-                # A FIRING burst runs to completion regardless of target loss; the
-                # autopilot's relay state is unchanged until our DISARMING phase.
+                # Lost target — drive the state machine with centered=False. With
+                # the simple timer-driven fire model, this means: don't initiate a
+                # new fire while not centered. An in-progress FIRING/COOLDOWN
+                # continues to completion regardless (the autopilot owns the cycle).
                 fire_advance(centered=False)
                 phase = fire_state["phase"]
                 is_firing = (phase == "FIRING")
-                fire_elapsed = (time.monotonic() - fire_state["phase_start_time"]) if is_firing else 0.0
+                fire_elapsed = (time.monotonic() - fire_state["fire_send_time"]) if is_firing else 0.0
                 with gimbal_state_lock:
                     gimbal_state["pitch"] = cur_pitch
                     gimbal_state["yaw"] = cur_yaw
