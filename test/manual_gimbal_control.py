@@ -8,12 +8,27 @@ last value and age of HEARTBEAT, ATTITUDE, SYS_STATUS, GLOBAL_POSITION_INT,
 VFR_HUD, GPS_RAW_INT, MOUNT_STATUS, GIMBAL_DEVICE_ATTITUDE_STATUS, RC_CHANNELS,
 and COMMAND_ACK.
 
-Controls (single keypress, no Enter required; hold key to repeat):
+Two run modes:
+
+  Interactive panel (default — no --live-fire):
+    Live gimbal control + telemetry panel. 'f' triggers a BLANK fire (logs only,
+    no relay command sent) for workflow testing.
+
+  One-shot fire (--live-fire):
+    Connect to MAVLink, send a single MAV_CMD_DO_REPEAT_RELAY, wait briefly for
+    the ACK, then exit. No panel, no key handler, no concurrent threads —
+    bypasses the interactive loop entirely so the relay command is issued from
+    a single linear code path. Parallel design to --center-gimbal in
+    tf_live_inferenceV2_gimbal_auto.py.
+
+Interactive panel keys (single keypress, no Enter required; hold to repeat):
   w / s   pitch up / down by step
   a / d   yaw  left / right by step
   c       center (pitch=0, yaw=0)
   + / -   increase / decrease step size
   r       resend current setpoint
+  f       simulate FIRE in BLANK mode (logs only)
+  F       emergency relay OFF (force fire=off)
   q       quit
 """
 
@@ -33,6 +48,8 @@ GIMBAL_PITCH_MIN_DEG = -45.0
 GIMBAL_PITCH_MAX_DEG = 45.0
 MAV_CMD_DO_MOUNT_CONTROL = 205
 MAV_MOUNT_MODE_MAVLINK_TARGETING = 2
+MAV_CMD_DO_SET_RELAY = 181
+MAV_CMD_DO_REPEAT_RELAY = 182
 
 STEP_MIN = 0.5
 STEP_MAX = 30.0
@@ -76,6 +93,36 @@ def send_mount_control(master, pitch_deg: float, yaw_deg: float) -> None:
         0.0,
         0.0,
         float(MAV_MOUNT_MODE_MAVLINK_TARGETING),
+    )
+
+
+def send_relay(master, relay_num: int, state: int) -> None:
+    """MAV_CMD_DO_SET_RELAY (181). state: 1=on, 0=off. Used here only for SAFETY
+    OFF — we forcibly drive the relay low on exit/emergency."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_SET_RELAY,
+        0,
+        float(int(relay_num)),
+        float(int(bool(state))),
+        0.0, 0.0, 0.0, 0.0, 0.0,
+    )
+
+
+def send_repeat_relay(master, relay_num: int, cycles: int, cycle_time_s: float) -> None:
+    """MAV_CMD_DO_REPEAT_RELAY (182). Mirrors QGroundControl's "Shoot Gun" action:
+    param1=relay, param2=cycles, param3=cycle_time. ArduPilot pulses the relay
+    for `cycles` cycles, each cycle period `cycle_time` seconds."""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        MAV_CMD_DO_REPEAT_RELAY,
+        0,
+        float(int(relay_num)),
+        float(int(cycles)),
+        float(cycle_time_s),
+        0.0, 0.0, 0.0, 0.0,
     )
 
 
@@ -186,16 +233,19 @@ class RawTerminal:
 
 
 def render(tel: Telemetry, pitch: float, yaw: float, step: float,
-           dry_run: bool, master_ok: bool, mav_string: str) -> None:
+           dry_run: bool, master_ok: bool, mav_string: str,
+           firing: bool = False, fire_relay: int = 2,
+           live_fire: bool = False, fire_elapsed: float = 0.0) -> None:
     out = [ANSI_HOME]
 
     def line(text: str) -> None:
         out.append(text + ANSI_CLEAR_TO_EOL + "\n")
 
     tx_state = "DRY-RUN" if dry_run else ("LIVE" if master_ok else "OFFLINE")
+    fire_mode_label = "LIVE-FIRE" if live_fire else "BLANK"
     line("=== Manual Gimbal Control + Live Telemetry ===")
-    line(f"link: {mav_string}    tx: {tx_state}    msgs_rx: {tel.total_msgs}")
-    line("controls: [w/s] pitch  [a/d] yaw  [c] center  [+/-] step  [r] resend  [q] quit")
+    line(f"link: {mav_string}    tx: {tx_state}    msgs_rx: {tel.total_msgs}    fire_mode: {fire_mode_label}")
+    line("controls: [w/s] pitch  [a/d] yaw  [c] center  [+/-] step  [r] resend  [f] FIRE  [F] off  [q] quit")
     line("")
 
     line(f"setpoint  pitch={pitch:+7.2f} deg   yaw={yaw:+7.2f} deg   step={step:5.2f} deg")
@@ -205,6 +255,12 @@ def render(tel: Telemetry, pitch: float, yaw: float, step: float,
              + (f"   ERR: {tel.last_send_err}" if tel.last_send_err else ""))
     else:
         line("          last_tx=  --     tx_count=0")
+
+    if firing:
+        line(f">>> PULSING ({fire_mode_label}) relay={fire_relay}  t={fire_elapsed:.2f}s  "
+             f"(autopilot owns timing; press F for emergency off) <<<")
+    else:
+        line(f"fire      idle  relay={fire_relay}  (press f to {'FIRE one burst' if live_fire else 'simulate burst'} via DO_REPEAT_RELAY)")
     line("")
     line("--- live telemetry (+ fresh <2s, ! stale, X never seen) ---")
 
@@ -336,12 +392,97 @@ def main() -> int:
                         help="Degrees per keypress (default: 2.0).")
     parser.add_argument("--initial-pitch", type=float, default=0.0)
     parser.add_argument("--initial-yaw", type=float, default=0.0)
+    parser.add_argument("--fire-relay", type=int, default=1,
+                        help="Relay instance for fire trigger (param1 of MAV_CMD_DO_REPEAT_RELAY). "
+                             "Matches the QGroundControl 'Shoot Gun' action default (relay 1).")
+    parser.add_argument("--fire-cycles", type=int, default=1,
+                        help="Cycles per fire press (param2 of MAV_CMD_DO_REPEAT_RELAY). Default 1.")
+    parser.add_argument("--fire-period", type=float, default=2.0,
+                        help="Cycle period in seconds (param3 of MAV_CMD_DO_REPEAT_RELAY). Default 2.0.")
+    parser.add_argument("--live-fire", action="store_true",
+                        help="DANGEROUS. One-shot fire-and-exit. With this flag set the script "
+                             "connects to MAVLink, sends a single MAV_CMD_DO_REPEAT_RELAY "
+                             "(matching the QGroundControl 'Shoot Gun' action), waits up to ~2.5s "
+                             "for the COMMAND_ACK, then exits. No panel, no key loop. Without this "
+                             "flag the script opens the interactive panel for gimbal control + "
+                             "BLANK fire simulation.")
     args = parser.parse_args()
 
     if args.step <= 0:
         parser.error("--step must be > 0")
     if args.send_rate <= 0 or args.redraw_rate <= 0:
         parser.error("--send-rate and --redraw-rate must be > 0")
+
+    # --live-fire: one-shot fire-and-exit, parallel to --center-gimbal in the
+    # autonomous script. Bypasses the interactive panel and key handler entirely
+    # so the relay command is issued from a single linear code path with no
+    # repaint loop or repeat-key dispatch in the picture.
+    if args.live_fire:
+        if args.no_mavlink:
+            print("[FIRE] --live-fire requires a MAVLink connection (conflict with --no-mavlink)")
+            return 2
+        try:
+            from pymavlink import mavutil
+        except ImportError:
+            print("[MAVLINK] pymavlink not installed.")
+            return 2
+        print(f"[MAVLINK] Connecting: {args.mavlink}")
+        try:
+            master = mavutil.mavlink_connection(args.mavlink)
+            master.wait_heartbeat(timeout=args.heartbeat_timeout)
+            print(f"[MAVLINK] heartbeat sysid={master.target_system} "
+                  f"compid={master.target_component}")
+        except Exception as e:
+            print(f"[MAVLINK] connect failed: {e}")
+            return 2
+        print(f"[FIRE ONE-SHOT] sending DO_REPEAT_RELAY(182) "
+              f"param1={args.fire_relay} param2={args.fire_cycles} "
+              f"param3={args.fire_period:.2f}s")
+        try:
+            send_repeat_relay(master, args.fire_relay, args.fire_cycles, args.fire_period)
+        except Exception as e:
+            print(f"[FIRE] send failed: {e}")
+            try:
+                master.close()
+            except Exception:
+                pass
+            return 2
+        pulse_duration = float(args.fire_cycles) * float(args.fire_period)
+        ack_deadline = time.monotonic() + max(0.5, pulse_duration + 0.5)
+        ack_seen = False
+        while time.monotonic() < ack_deadline:
+            try:
+                msg = master.recv_match(blocking=False)
+            except Exception:
+                msg = None
+            if msg is None:
+                time.sleep(0.02)
+                continue
+            if msg.get_type() == "COMMAND_ACK":
+                try:
+                    cmd = int(msg.command)
+                    if cmd in (MAV_CMD_DO_REPEAT_RELAY, MAV_CMD_DO_SET_RELAY):
+                        print(f"[ACK] cmd={cmd} result={msg.result} "
+                              f"(0=ACCEPTED, 2=DENIED, 4=FAILED, 5=UNSUPPORTED)")
+                        if cmd == MAV_CMD_DO_REPEAT_RELAY:
+                            ack_seen = True
+                except Exception:
+                    pass
+            elif msg.get_type() == "STATUSTEXT":
+                text = (getattr(msg, "text", "") or "").strip()
+                if text:
+                    print(f"[STATUSTEXT sev={getattr(msg, 'severity', '?')}] {text}")
+        if not ack_seen:
+            print("[FIRE] WARNING: no ACK for cmd=182 within "
+                  f"{max(0.5, pulse_duration + 0.5):.2f}s "
+                  f"(packet may have been lost or autopilot didn't respond)")
+        else:
+            print("[FIRE] done")
+        try:
+            master.close()
+        except Exception:
+            pass
+        return 0
 
     master = None
     if not args.no_mavlink:
@@ -378,6 +519,49 @@ def main() -> int:
     send_interval = 1.0 / float(args.send_rate)
     redraw_interval = 1.0 / float(args.redraw_rate)
     heartbeat_send_interval = 1.0 / float(args.heartbeat_send_rate)
+
+    firing = False
+    fire_start_time: Optional[float] = None
+    # MAV_CMD_DO_REPEAT_RELAY is fire-and-forget: ArduPilot owns the pulse timing,
+    # so the script just tracks how long the burst should last for the UI banner.
+    fire_burst_duration = float(args.fire_cycles) * float(args.fire_period)
+
+    def fire_pulse() -> None:
+        """Send one DO_REPEAT_RELAY burst per 'f' press. Exact shape of
+        QGroundControl's 'Shoot Gun' action. NO double-send — two commands
+        within the cycle window cause the autopilot to start overlapping pulse
+        state machines, producing on/off/on/off chatter."""
+        nonlocal firing, fire_start_time
+        mode = "LIVE" if args.live_fire else "BLANK"
+        if args.live_fire and master is not None:
+            try:
+                send_repeat_relay(master, args.fire_relay, args.fire_cycles, args.fire_period)
+            except Exception as e:
+                print(f"\n[FIRE ERROR] DO_REPEAT_RELAY failed: {e}", flush=True)
+                return
+        firing = True
+        fire_start_time = time.monotonic()
+        print(f"\n[{mode} FIRE PULSE] cmd=DO_REPEAT_RELAY(182) param1={args.fire_relay} "
+              f"param2={args.fire_cycles} param3={args.fire_period:.2f}s "
+              f"(autopilot will hold ON ~{fire_burst_duration/2:.2f}s)", flush=True)
+
+    def fire_force_off() -> None:
+        """Belt-and-suspenders safety: send DO_SET_RELAY(relay, 0) to drive the
+        relay low immediately. The autopilot's repeat-relay timer should also
+        reset on a fresh DO_SET_RELAY command."""
+        nonlocal firing, fire_start_time
+        if args.live_fire and master is not None:
+            for _ in range(3):
+                try:
+                    send_relay(master, args.fire_relay, 0)
+                except Exception:
+                    break
+                time.sleep(0.02)
+        mode = "LIVE" if args.live_fire else "BLANK"
+        print(f"\n[{mode} FIRE EMERGENCY OFF] cmd=DO_SET_RELAY(181) param1={args.fire_relay} param2=0",
+              flush=True)
+        firing = False
+        fire_start_time = None
 
     def transmit() -> None:
         if master is None:
@@ -432,6 +616,10 @@ def main() -> int:
                         step = max(STEP_MIN, step - 0.5)
                     elif ch in ("r", "R"):
                         dirty = True
+                    elif ch == "f":
+                        fire_pulse()
+                    elif ch == "F":
+                        fire_force_off()
                     ch = term.read_key()
 
                 if master is not None:
@@ -453,11 +641,22 @@ def main() -> int:
                     last_heartbeat_send = now
                     last_send = now
 
+                # MAV_CMD_DO_REPEAT_RELAY is fire-and-forget. Auto-clear the firing
+                # flag once the autopilot's burst is done.
+                if firing and fire_start_time is not None:
+                    if (now - fire_start_time) >= fire_burst_duration:
+                        firing = False
+                        fire_start_time = None
+
                 if (now - last_redraw) >= redraw_interval:
                     render(tel, pitch, yaw, step,
                            dry_run=args.no_mavlink,
                            master_ok=master is not None,
-                           mav_string=args.mavlink if not args.no_mavlink else "(disabled)")
+                           mav_string=args.mavlink if not args.no_mavlink else "(disabled)",
+                           firing=firing,
+                           fire_relay=args.fire_relay,
+                           live_fire=args.live_fire,
+                           fire_elapsed=(now - fire_start_time) if (firing and fire_start_time) else 0.0)
                     last_redraw = now
 
                 time.sleep(0.005)
@@ -465,8 +664,19 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # SAFETY: force the relay OFF on every exit path so the gun cannot
+        # be left firing if the script crashes or is Ctrl-C'd while engaged.
+        if args.live_fire and master is not None:
+            for _ in range(3):
+                try:
+                    send_relay(master, args.fire_relay, 0)
+                except Exception:
+                    break
+                time.sleep(0.02)
         sys.stdout.write(ANSI_SHOW_CURSOR + "\n")
         sys.stdout.flush()
+        if args.live_fire:
+            print(f"[FIRE] safety: relay {args.fire_relay} forced OFF on exit")
         if master is not None:
             try:
                 master.close()
