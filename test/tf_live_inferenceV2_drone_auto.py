@@ -172,6 +172,56 @@ def apply_clahe_bgr(frame, clip_limit=2.0, grid_size=8):
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
 
+def apply_grayscale_bgr(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def apply_luminance_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.convertScaleAbs(l, alpha=factor, beta=0)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def apply_contrast_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    return cv2.convertScaleAbs(frame, alpha=factor, beta=128.0 * (1.0 - factor))
+
+
+def apply_saturation_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    s = cv2.convertScaleAbs(s, alpha=factor, beta=0)
+    return cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+
+
+def apply_unsharp_bgr(frame, amount: float, sigma: float = 1.0):
+    if amount <= 0.0:
+        return frame
+    blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=sigma)
+    return cv2.addWeighted(frame, 1.0 + amount, blurred, -amount, 0)
+
+
+def apply_preproc(frame, args):
+    if args.grayscale:
+        frame = apply_grayscale_bgr(frame)
+    if args.luminance != 1.0:
+        frame = apply_luminance_bgr(frame, args.luminance)
+    if args.contrast != 1.0:
+        frame = apply_contrast_bgr(frame, args.contrast)
+    if args.saturation != 1.0 and not args.grayscale:
+        frame = apply_saturation_bgr(frame, args.saturation)
+    if args.sharpen > 0.0:
+        frame = apply_unsharp_bgr(frame, args.sharpen, args.sharpen_sigma)
+    return frame
+
+
 def filter_detections(detections, frame, min_conf=0.05, max_area_ratio=0.35, edge_margin_ratio=0.01):
     h, w = frame.shape[:2]
     frame_area = float(w * h)
@@ -381,11 +431,15 @@ class MovementLink:
         send_rate_hz: float,
         dry_run: bool,
         require_guided_to_send: bool = True,
+        rangefinder_orientation: int = 0,
     ):
         self.master = master
         self.dry_run = dry_run
         self.require_guided_to_send = require_guided_to_send
         self.send_interval = 1.0 / max(1.0, float(send_rate_hz))
+        # Orientation filter for DISTANCE_SENSOR (-1 = accept all)
+        self.rangefinder_orientation = int(rangefinder_orientation)
+        self._rejected_orientations = {}  # orientation -> last_log_time
 
         self._lock = threading.Lock()
         self._vx = 0.0
@@ -583,6 +637,21 @@ class MovementLink:
                     pass
             elif t == "DISTANCE_SENSOR":
                 try:
+                    orientation = int(getattr(msg, "orientation", 0))
+                    if (
+                        self.rangefinder_orientation != -1
+                        and orientation != self.rangefinder_orientation
+                    ):
+                        # Wrong-orientation rangefinder (e.g. downward when we want forward).
+                        # Rate-limit a warning so the user knows it's being filtered out.
+                        last = self._rejected_orientations.get(orientation, 0.0)
+                        if now - last > 5.0:
+                            self._rejected_orientations[orientation] = now
+                            print(f"[RANGEFINDER] Ignoring DISTANCE_SENSOR with "
+                                  f"orientation={orientation} (want={self.rangefinder_orientation}). "
+                                  f"Override with --rangefinder-orientation.",
+                                  flush=True)
+                        continue
                     current_cm = float(getattr(msg, "current_distance", 0))
                     with self._lock:
                         self._last_distance_cm = (current_cm, now)
@@ -746,6 +815,19 @@ def main():
     parser.add_argument("--clahe-clip-limit", type=float, default=2.0)
     parser.add_argument("--clahe-grid", type=int, default=8)
 
+    parser.add_argument("--grayscale", action="store_true",
+                        help="Convert frame to grayscale before inference (broadcast to 3 channels). Drops color cues entirely.")
+    parser.add_argument("--luminance", type=float, default=1.0,
+                        help="Luminance multiplier on LAB L-channel. 1.0=no-op, >1=brighter midtones, <1=darker. Try 1.10-1.30.")
+    parser.add_argument("--contrast", type=float, default=1.0,
+                        help="Contrast multiplier around mid-gray (128). 1.0=no-op, >1=more contrast. Try 1.15-1.40.")
+    parser.add_argument("--saturation", type=float, default=1.0,
+                        help="Saturation multiplier on HSV S-channel. 1.0=no-op, 0=desaturated, >1=more vivid. Try 0.50-0.80 to mute colored distractors.")
+    parser.add_argument("--sharpen", type=float, default=0.0,
+                        help="Unsharp-mask amount. 0=off, 0.5-1.0=typical, >2.0=artificial. Try 0.5-1.0.")
+    parser.add_argument("--sharpen-sigma", type=float, default=1.0,
+                        help="Unsharp-mask blur radius (sigma). 1.0=tight halo for small targets, 2.0=wider.")
+
     # --- MAVLink connection ---
     parser.add_argument("--mavlink", type=str, default="tcp:10.42.0.1:5760",
                         help="pymavlink connection string (default: tcp:10.42.0.1:5760)")
@@ -831,6 +913,11 @@ def main():
                              "DISTANCE_SENSOR. Auto-enabled by --no-mavlink. Otherwise "
                              "the script requires real DISTANCE_SENSOR within "
                              "--distance-sensor-timeout seconds of connect.")
+    parser.add_argument("--rangefinder-orientation", type=int, default=0,
+                        help="MAV_SENSOR_ORIENTATION enum value to accept from "
+                             "DISTANCE_SENSOR. 0 = MAV_SENSOR_ROTATION_NONE = forward "
+                             "(default). 25 = PITCH_270 = downward. Use -1 to accept "
+                             "any orientation (legacy behavior; can mix forward+down).")
     parser.add_argument("--distance-sensor-timeout", type=float, default=5.0,
                         help="Seconds to wait for first DISTANCE_SENSOR after connect.")
 
@@ -895,8 +982,32 @@ def main():
     if args.live_fly and args.no_mavlink:
         print("[ERROR] --live-fly and --no-mavlink are mutually exclusive.", flush=True)
         sys.exit(EXIT_ARG_CONFLICT)
+    if args.live_fly and args.simulate_distance:
+        print("[ERROR] --live-fly and --simulate-distance are mutually exclusive.\n"
+              "  Real motors driven by a fake distance signal would close on a wall "
+              "the script cannot see. Use a real forward rangefinder for any live flight.",
+              flush=True)
+        sys.exit(EXIT_ARG_CONFLICT)
     if args.no_mavlink:
         args.simulate_distance = True  # forced — no telemetry source available
+
+    for n, v in (("--luminance", args.luminance), ("--contrast", args.contrast),
+                 ("--saturation", args.saturation), ("--sharpen", args.sharpen),
+                 ("--sharpen-sigma", args.sharpen_sigma)):
+        if v < 0.0:
+            parser.error(f"{n} must be >= 0")
+
+    preproc_parts = []
+    if args.grayscale: preproc_parts.append("grayscale")
+    if args.luminance != 1.0: preproc_parts.append(f"luminance={args.luminance:.2f}")
+    if args.contrast != 1.0: preproc_parts.append(f"contrast={args.contrast:.2f}")
+    if args.saturation != 1.0 and not args.grayscale: preproc_parts.append(f"saturation={args.saturation:.2f}")
+    if args.sharpen > 0.0: preproc_parts.append(f"sharpen={args.sharpen:.2f}(sigma={args.sharpen_sigma:.1f})")
+    if args.clahe: preproc_parts.append(f"clahe(clip={args.clahe_clip_limit:.1f},grid={args.clahe_grid})")
+    if preproc_parts:
+        print(f"[PREPROC] {' | '.join(preproc_parts)}", flush=True)
+    else:
+        print("[PREPROC] (none — defaults)", flush=True)
 
     # --- Camera ---
     cap = cv2.VideoCapture(pipeline3, cv2.CAP_GSTREAMER)
@@ -949,24 +1060,38 @@ def main():
 
     # --- Wait briefly for first DISTANCE_SENSOR (real mode only) ---
     if not args.simulate_distance:
+        want_orient = args.rangefinder_orientation
+        orient_desc = ("any orientation" if want_orient == -1
+                       else f"orientation={want_orient}")
         print(f"[INIT] Waiting up to {args.distance_sensor_timeout:.1f}s for first "
-              f"DISTANCE_SENSOR...", flush=True)
+              f"DISTANCE_SENSOR ({orient_desc})...", flush=True)
         end_t = time.monotonic() + args.distance_sensor_timeout
         got = False
+        seen_orientations = set()
         while time.monotonic() < end_t:
             try:
                 msg = master.recv_match(blocking=True, timeout=0.3)
             except Exception:
                 msg = None
             if msg is not None and msg.get_type() == "DISTANCE_SENSOR":
+                msg_orient = int(getattr(msg, "orientation", 0))
+                seen_orientations.add(msg_orient)
+                if want_orient != -1 and msg_orient != want_orient:
+                    continue  # wrong orientation (likely downward); keep waiting
                 cm = float(getattr(msg, "current_distance", 0))
-                print(f"[INIT] DISTANCE_SENSOR seen: {cm:.1f} cm", flush=True)
+                print(f"[INIT] DISTANCE_SENSOR seen: {cm:.1f} cm "
+                      f"(orientation={msg_orient})", flush=True)
                 got = True
                 break
         if not got:
-            print(f"[ERROR] No DISTANCE_SENSOR within {args.distance_sensor_timeout:.1f}s.\n"
-                  f"  Either configure a rangefinder on the airframe or re-run with "
-                  f"--simulate-distance.", flush=True)
+            seen_str = (", ".join(str(o) for o in sorted(seen_orientations))
+                        if seen_orientations else "none")
+            print(f"[ERROR] No DISTANCE_SENSOR with {orient_desc} within "
+                  f"{args.distance_sensor_timeout:.1f}s.\n"
+                  f"  Orientations seen on the bus: {seen_str}.\n"
+                  f"  Either configure a forward-facing rangefinder, re-run with "
+                  f"--rangefinder-orientation <value> to match what you have, or use "
+                  f"--simulate-distance for a dry test.", flush=True)
             try:
                 master.close()
             except Exception:
@@ -979,6 +1104,7 @@ def main():
         send_rate_hz=args.tx_rate,
         dry_run=(args.no_mavlink or not args.live_fly),
         require_guided_to_send=(not args.no_guided_check) and (not args.no_mavlink),
+        rangefinder_orientation=args.rangefinder_orientation,
     )
 
     # --- Print startup banner ---
@@ -992,15 +1118,34 @@ def main():
     print(f"[INFO] guided check: "
           f"{'enforced — startup mode=' + str(flightmode) if not args.no_guided_check else 'BYPASSED via --no-guided-check'}",
           flush=True)
-    print(f"[INFO] distance source: "
-          f"{'SIMULATED (drift+jitter)' if args.simulate_distance else 'DISTANCE_SENSOR (msg 132) from autopilot'}",
-          flush=True)
+    if args.simulate_distance:
+        print("[INFO] distance source: SIMULATED (drift+jitter)", flush=True)
+    else:
+        if args.rangefinder_orientation == -1:
+            ori_label = "ANY orientation (no filter — legacy)"
+        elif args.rangefinder_orientation == 0:
+            ori_label = "orientation=0 (FORWARD / MAV_SENSOR_ROTATION_NONE)"
+        elif args.rangefinder_orientation == 25:
+            ori_label = "orientation=25 (DOWNWARD / MAV_SENSOR_ROTATION_PITCH_270)"
+        else:
+            ori_label = f"orientation={args.rangefinder_orientation}"
+        print(f"[INFO] distance source: DISTANCE_SENSOR (msg 132) from autopilot, "
+              f"filtered to {ori_label}", flush=True)
     print(f"[INFO] tx rate: {args.tx_rate:.1f} Hz", flush=True)
     print(f"[INFO] target distance: {args.target_distance_cm:.0f} ± "
           f"{args.distance_tolerance_cm:.0f} cm; alt target y-ratio: "
           f"{args.altitude_target_y_ratio:.2f}", flush=True)
     print(f"[INFO] gains: yaw={args.yaw_gain:.1f}deg/s/full forward={args.forward_gain:.2f} "
           f"alt={args.altitude_gain:.2f}", flush=True)
+    print("[INFO] State machine flow (sim/normal):", flush=True)
+    print("  NO_TARGET       : no detection in frame; commanding zeros", flush=True)
+    print(f"  CENTERING       : target seen, yaw toward center until |err_x| <= deadband ({args.deadband:.2f})", flush=True)
+    print(f"  APPROACH        : yaw aligned, lidar outside {args.target_distance_cm:.0f}±{args.distance_tolerance_cm:.0f}cm; vx toward target", flush=True)
+    print(f"  HOLD            : lidar inside window; counting hold frames toward lock ({args.lock_confirm_frames})", flush=True)
+    print("  LOCKED_HOLD     : lock latched; sticky yaw/dist trims only (one-way; never leaves)", flush=True)
+    print(f"  ALTITUDE_ADJUST : after lock; vz toward y-ratio {args.altitude_target_y_ratio:.2f} of frame", flush=True)
+    print(f"  FINAL_HOLD      : altitude confirmed ({args.altitude_lock_confirm_frames} frames); steady-state trim only", flush=True)
+    print("[INFO] Watch for '[STATE]' lines on every transition. '[F######]' shows per-frame state.", flush=True)
     if args.live_fly:
         print("[WARN] *** LIVE-FLY ENABLED *** SET_POSITION_TARGET_LOCAL_NED will be sent "
               "to the autopilot at the tx rate. Ensure operator is on RC override.",
@@ -1090,6 +1235,8 @@ def main():
         altitude_confirm_count = 0
         final_hold_engaged = False
         sim_target_cy = None  # used both for sticky altitude target after lock AND for simulated altitude dynamics
+        prev_state = None  # for [STATE] transition logging
+        run_start = time.perf_counter()
 
         while not stop_event.is_set():
             frame_event.wait(timeout=0.1)
@@ -1106,7 +1253,7 @@ def main():
             dt = clamp(now - sim_state["last_tick"], 0.001, 0.2)
             sim_state["last_tick"] = now
 
-            infer_frame = frame
+            infer_frame = apply_preproc(frame, args)
             if args.clahe:
                 infer_frame = apply_clahe_bgr(
                     infer_frame, clip_limit=args.clahe_clip_limit,
@@ -1475,33 +1622,63 @@ def main():
             mode_str, mode_age = link.get_mode()
             mode_tag = mode_str if mode_str else "NO_HB"
             tx_tag = "LIVE" if args.live_fly else "BLANK"
+
+            # --- State transition log: one line whenever state changes ---
+            if state != prev_state:
+                elapsed = time.perf_counter() - run_start
+                reason_bits = []
+                if selected is None:
+                    reason_bits.append("no detection in frame")
+                else:
+                    reason_bits.append(f"target conf={target_confidence:.2f}")
+                    reason_bits.append(f"err_x={err_x:+.3f} ({'aligned' if abs(err_x) <= args.deadband else 'off-center'})")
+                reason_bits.append(f"lidar={lidar_cm:.1f}cm[{dist_status}]")
+                reason_bits.append(f"dist_err={dist_error_cm:+.1f}cm")
+                if state in (STATE_HOLD, STATE_APPROACH):
+                    reason_bits.append(f"hold={hold_confirm_count}/{args.lock_confirm_frames}")
+                if state in (STATE_ALTITUDE_ADJUST, STATE_FINAL_HOLD):
+                    reason_bits.append(
+                        f"alt_err_norm={alt_error_norm:+.3f} "
+                        f"alt_confirm={altitude_confirm_count}/{args.altitude_lock_confirm_frames}"
+                    )
+                if state == STATE_LOCKED:
+                    reason_bits.append("LOCK LATCHED — sticky")
+                arrow = f"{prev_state or 'INIT'} -> {state}"
+                print(
+                    f"[STATE {elapsed:6.2f}s] {arrow:38s}  why: " + " | ".join(reason_bits),
+                    flush=True,
+                )
+                prev_state = state
+
             if selected is None:
                 print(
-                    f"[F{frame_idx:06d}] NO_TARGET state={state} "
-                    f"mode={mode_tag} tx={tx_tag} "
-                    f"lidar={lidar_cm:.1f}cm({lidar_source}) "
-                    f"lock={lock_status} hold={hold_confirm_count}/{args.lock_confirm_frames} "
+                    f"[F{frame_idx:06d} {state}/{move_label}] "
+                    f"(no detection) | "
+                    f"lidar={lidar_cm:.1f}cm({lidar_source}) | "
+                    f"CMD vx={vx:+.3f} vz={vz:+.3f} yaw={yaw_rate:+.2f}deg/s | "
+                    f"hold={hold_confirm_count}/{args.lock_confirm_frames} "
                     f"alt={altitude_confirm_count}/{args.altitude_lock_confirm_frames} "
-                    f"final_hold={final_hold_status} "
-                    f"CMD vx={vx:+.3f} vz={vz:+.3f} yaw_rate={yaw_rate:+.2f}deg/s",
+                    f"lock={lock_status} final={final_hold_status} | "
+                    f"mode={mode_tag} tx={tx_tag}",
                     flush=True,
                 )
             else:
                 (x1, y1), (x2, y2) = selected["bbox"]
+                actual_str = ""
+                if actual_vx is not None:
+                    actual_str += f" actual_vx={actual_vx:+.2f}"
+                if actual_vz is not None:
+                    actual_str += f" actual_vz={actual_vz:+.2f}"
                 print(
-                    f"[F{frame_idx:06d}] target_bbox=(({int(x1)},{int(y1)}),({int(x2)},{int(y2)})) "
-                    f"center=({tcx},{tcy}) err=({err_x:+.3f},{err_y:+.3f}) "
-                    f"conf={target_confidence:.3f} state={state} action={move_label} "
-                    f"mode={mode_tag} tx={tx_tag} "
-                    f"lidar={lidar_cm:.1f}cm({lidar_source})/{dist_status} "
-                    f"dist_err={dist_error_cm:+.1f}cm "
-                    f"lock={lock_status} hold={hold_confirm_count}/{args.lock_confirm_frames} "
+                    f"[F{frame_idx:06d} {state}/{move_label}] "
+                    f"target conf={target_confidence:.3f} bbox=(({int(x1)},{int(y1)})->({int(x2)},{int(y2)})) "
+                    f"center=({tcx},{tcy}) err=(x:{err_x:+.3f},y:{err_y:+.3f}) yaw_to_ctr={yaw_to_center_deg:+.2f}deg | "
+                    f"lidar={lidar_cm:.1f}cm({lidar_source})/{dist_status} dist_err={dist_error_cm:+.1f}cm | "
+                    f"CMD vx={vx:+.3f}m/s vz={vz:+.3f}m/s yaw={yaw_rate:+.2f}deg/s{actual_str} | "
+                    f"hold={hold_confirm_count}/{args.lock_confirm_frames} "
                     f"alt={altitude_confirm_count}/{args.altitude_lock_confirm_frames} "
-                    f"final_hold={final_hold_status} "
-                    f"yaw_to_center={yaw_to_center_deg:+.2f}deg "
-                    f"CMD vx={vx:+.3f}m/s vz={vz:+.3f}m/s yaw_rate={yaw_rate:+.2f}deg/s "
-                    + (f"actual_vx={actual_vx:.2f}m/s " if actual_vx is not None else "")
-                    + (f"actual_vz={actual_vz:+.2f}m/s " if actual_vz is not None else ""),
+                    f"lock={lock_status} final={final_hold_status} | "
+                    f"mode={mode_tag} tx={tx_tag}",
                     flush=True,
                 )
 

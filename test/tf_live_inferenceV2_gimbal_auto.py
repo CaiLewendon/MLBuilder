@@ -69,7 +69,7 @@ COCO80_NAMES = [
 ]
 
 pipeline3 = (
-    "rtspsrc location=rtsp://10.42.0.1:8554/gun_high latency=200 ! "
+    "rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! "
     "rtpjitterbuffer latency=200 ! "
     "rtph264depay ! "
     "h264parse ! "
@@ -115,6 +115,56 @@ def apply_clahe_bgr(frame, clip_limit=2.0, grid_size=8):
     l2 = clahe.apply(l)
     merged = cv2.merge((l2, a, b))
     return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+
+def apply_grayscale_bgr(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def apply_luminance_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.convertScaleAbs(l, alpha=factor, beta=0)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def apply_contrast_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    return cv2.convertScaleAbs(frame, alpha=factor, beta=128.0 * (1.0 - factor))
+
+
+def apply_saturation_bgr(frame, factor: float):
+    if factor == 1.0:
+        return frame
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    s = cv2.convertScaleAbs(s, alpha=factor, beta=0)
+    return cv2.cvtColor(cv2.merge((h, s, v)), cv2.COLOR_HSV2BGR)
+
+
+def apply_unsharp_bgr(frame, amount: float, sigma: float = 1.0):
+    if amount <= 0.0:
+        return frame
+    blurred = cv2.GaussianBlur(frame, (0, 0), sigmaX=sigma)
+    return cv2.addWeighted(frame, 1.0 + amount, blurred, -amount, 0)
+
+
+def apply_preproc(frame, args):
+    if args.grayscale:
+        frame = apply_grayscale_bgr(frame)
+    if args.luminance != 1.0:
+        frame = apply_luminance_bgr(frame, args.luminance)
+    if args.contrast != 1.0:
+        frame = apply_contrast_bgr(frame, args.contrast)
+    if args.saturation != 1.0 and not args.grayscale:
+        frame = apply_saturation_bgr(frame, args.saturation)
+    if args.sharpen > 0.0:
+        frame = apply_unsharp_bgr(frame, args.sharpen, args.sharpen_sigma)
+    return frame
 
 
 def filter_detections(detections, frame, min_conf=0.05, max_area_ratio=0.35, edge_margin_ratio=0.01):
@@ -591,6 +641,19 @@ def main():
     parser.add_argument("--clahe-clip-limit", type=float, default=2.0, help="CLAHE clip limit")
     parser.add_argument("--clahe-grid", type=int, default=8, help="CLAHE grid size")
 
+    parser.add_argument("--grayscale", action="store_true",
+                        help="Convert frame to grayscale before inference (broadcast to 3 channels). Drops color cues entirely.")
+    parser.add_argument("--luminance", type=float, default=1.0,
+                        help="Luminance multiplier on LAB L-channel. 1.0=no-op, >1=brighter midtones, <1=darker. Try 1.10-1.30.")
+    parser.add_argument("--contrast", type=float, default=1.0,
+                        help="Contrast multiplier around mid-gray (128). 1.0=no-op, >1=more contrast. Try 1.15-1.40.")
+    parser.add_argument("--saturation", type=float, default=1.0,
+                        help="Saturation multiplier on HSV S-channel. 1.0=no-op, 0=desaturated, >1=more vivid. Try 0.50-0.80 to mute colored distractors.")
+    parser.add_argument("--sharpen", type=float, default=0.0,
+                        help="Unsharp-mask amount. 0=off, 0.5-1.0=typical, >2.0=artificial. Try 0.5-1.0.")
+    parser.add_argument("--sharpen-sigma", type=float, default=1.0,
+                        help="Unsharp-mask blur radius (sigma). 1.0=tight halo for small targets, 2.0=wider.")
+
     parser.add_argument("--mavlink", type=str, default="tcp:10.42.0.1:5760",
                         help="pymavlink connection string (default: tcp:10.42.0.1:5760)")
     parser.add_argument("--no-mavlink", action="store_true",
@@ -698,6 +761,24 @@ def main():
         parser.error("--no-fire and --live-fire are mutually exclusive")
     if not (0 <= args.fire_relay <= 15):
         parser.error("--fire-relay must be between 0 and 15")
+
+    for n, v in (("--luminance", args.luminance), ("--contrast", args.contrast),
+                 ("--saturation", args.saturation), ("--sharpen", args.sharpen),
+                 ("--sharpen-sigma", args.sharpen_sigma)):
+        if v < 0.0:
+            parser.error(f"{n} must be >= 0")
+
+    preproc_parts = []
+    if args.grayscale: preproc_parts.append("grayscale")
+    if args.luminance != 1.0: preproc_parts.append(f"luminance={args.luminance:.2f}")
+    if args.contrast != 1.0: preproc_parts.append(f"contrast={args.contrast:.2f}")
+    if args.saturation != 1.0 and not args.grayscale: preproc_parts.append(f"saturation={args.saturation:.2f}")
+    if args.sharpen > 0.0: preproc_parts.append(f"sharpen={args.sharpen:.2f}(sigma={args.sharpen_sigma:.1f})")
+    if args.clahe: preproc_parts.append(f"clahe(clip={args.clahe_clip_limit:.1f},grid={args.clahe_grid})")
+    if preproc_parts:
+        print(f"[PREPROC] {' | '.join(preproc_parts)}", flush=True)
+    else:
+        print("[PREPROC] (none — defaults)", flush=True)
 
     if args.center_gimbal:
         master = None
@@ -991,7 +1072,7 @@ def main():
                 continue
             last_seen = seq
 
-            infer_frame = frame
+            infer_frame = apply_preproc(frame, args)
             if args.clahe:
                 infer_frame = apply_clahe_bgr(
                     infer_frame, clip_limit=args.clahe_clip_limit,
