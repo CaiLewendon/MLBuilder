@@ -1,62 +1,47 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-17 — `FullDataSetProdV2` TRAINED + WEIGHTS PROMOTED; int8 export + EdgeTPU compile NOT YET DONE)
+## ⏸ WHERE WE LEFT OFF (2026-05-17 — `FullDataSetProdV2` FULL PIPELINE COMPLETE; EdgeTPU artifact READY for Pi deploy + A/B compare)
 
-**Session summary:**
-- User provided new Label Studio export: `downloadedUpdatedProductiondata/` (3727 images, single class "Target", ~7% larger than the prior 3487-image FullDataSetProd dataset). Same Label Studio "YOLO with Images" format.
-- Ran `test/prepare_dataset_split.py --dataset downloadedUpdatedProductiondata --val-ratio 0.2 --hash-threshold 5 --seed 42` → **2982 train / 745 val**. 1027 clusters, 802 singletons, largest cluster 990 images (same near-stationary camera sequence as before — kept whole in train).
-- GPU was inaccessible (kernel-vs-driver mismatch — duplicate `nvidia-driver-550` + `nvidia-driver-580` installed). User rebooted; driver 580.142 came back clean, RTX 3070 Laptop online, 7.4 GB free.
-- Trained `yolo11n.pt` → `FullDataSetProdV2` for 40 epochs, batch=20, imgsz=640 — **same recipe as FullDataSetProd**. Wall time **0.282 hours (~17 min)**. AdamW auto-selected (lr=0.002, momentum=0.9). Ultralytics again ignored `project=build/out` and wrote to `~/Documents/MLBuilder/runs/detect/build/out/FullDataSetProdV2/`.
+**Session summary (continuation of the morning training session):**
+- Resumed from "weights promoted, export pending." Built 500-image deterministic calib subset (`shuf -n 500 --random-source=<(yes 42)`), authored `data_calib_subset.yaml`, then ran `venv/bin/yolo export … int8=True` — completed in **2034.5s (~34 min)** producing all 5 TFLite variants. Ultralytics emitted the expected CONV_2D op-version 6 + single grouped-CONV_2D collapse — same op-graph quirk as V1.
+- Re-ran the TF 2.15 sidecar workaround (`venv-tf215` had drifted back to TF 2.19; reinstalled 2.15.0): built `build/calib_500x3x640x640_float32_v2.npy` (2.3 GB, NCHW), ran `convert_int8_tf215.py` against the V2 SavedModel (~5.5 min), then surgery (`surgery_grouped_to_depthwise.py` converted op 145, filter `(128,3,3,1)` input_C=128 → DEPTHWISE — same coordinate as V1), then **new helper** `build/downgrade_conv2d_version.py` (5-line CONV_2D op-code version 6 → 3). Smoke-tested with `tf.lite.Interpreter`: input/output int8 (scale 0.00393, zero -128 / scale 0.00403, zero -126), output shape `(1, 5, 8400)` ✓.
+- `edgetpu_compiler 16.0.384591198` compiled in **980 ms** — 132 ops on EdgeTPU / 211 on CPU (same proportional split as V1's 132/339). 1.27 MiB on-chip cache used, 5.63 MiB remaining. **Build helpers `build/build_calib_npy.py` and `build/convert_int8_tf215.py` were parameterized via `sys.argv[1..3]`** for reuse on future retrains.
 
-**Training results (val on best.pt):**
-| Metric | FullDataSetProdV2 (new) | FullDataSetProd (prior, deployed) | Delta |
-|---|---|---|---|
-| Precision | 0.899 | 0.956 | -0.057 |
-| Recall | 0.891 | 0.85 | **+0.041** |
-| mAP50 | 0.947 | 0.951 | ~same |
-| mAP50-95 | 0.646 | 0.719 | -0.073 |
-
-Higher recall, slightly lower precision and bbox-localization quality. Net mAP50 essentially identical. Field validation needed to judge real-world effect.
-
-**Artifacts on disk:**
-- `export/FullDataSetProdV2.pt` (5.45 MB, sha256 `d7ad6f995bbf52d164caa88c612c17e93c2c4fae626f75d41a841915692894e0`)
-- `export/FullDataSetProdV2_last.pt` (5.45 MB)
-- `downloadedUpdatedProductiondata/train.txt` (2982 entries)
-- `downloadedUpdatedProductiondata/val.txt` (745 entries)
-- `downloadedUpdatedProductiondata/calib_all.txt` (3727 entries — for later subset)
-- `downloadedUpdatedProductiondata/data.yaml` and `data_calib.yaml`
-- `build_FullDataSetProdV2_train.log` (full training console output)
+**Final EdgeTPU artifact:**
+- `export/FullDataSetProdV2_edgetpu.tflite` (3.05 MiB / 3200896 bytes)
+- sha256 **`4a36c548031f746776e4ff6e90b8fe521fb6cc44673fbc5c7fb5fcc951925259`**
+- Pre-compile source: `export/FullDataSetProdV2_saved_model/FullDataSetProdV2_full_integer_quant_dwfix_v3.tflite` sha256 `7f81384e314b08984578281313902931136b5c8e374bb2c161af7a3d26160e6a`
+- Input: int8 NHWC `(1,640,640,3)` scale 1/255, zero -128. Output: int8 `(1,5,8400)` raw head — **same signature as V1 FullDataSetProd; identify by sha256, not shape** ([[feedback-hash-not-shape]]).
 
 **REMAINING STEPS (next session — resume here):**
 
-1. **Build 500-image calibration subset** (OOM-safe per [[int8-calibration-cap]]):
+1. **Deploy to Pi** (do NOT overwrite V1 — keep both for A/B):
    ```bash
-   cd downloadedUpdatedProductiondata && \
-   shuf -n 500 --random-source=<(yes 42) calib_all.txt > calib_subset_500.txt
-   # Write data_calib_subset.yaml referencing calib_subset_500.txt
+   scp export/FullDataSetProdV2_edgetpu.tflite pi@<PI_IP>:~/FullDataSetProdV2_edgetpu.tflite
+   ssh pi@<PI_IP> 'sha256sum ~/FullDataSetProdV2_edgetpu.tflite'
+   # should print 4a36c548031f746776e4ff6e90b8fe521fb6cc44673fbc5c7fb5fcc951925259
    ```
 
-2. **Export to int8 TFLite** (~35 min wall time per prior session):
+2. **Live-verify on Pi** with the production preproc recipe:
    ```bash
-   venv/bin/yolo export model=export/FullDataSetProdV2.pt format=tflite int8=True \
-     data=downloadedUpdatedProductiondata/data_calib_subset.yaml imgsz=640
+   python -B tf_live_inferenceV2.py ~/FullDataSetProdV2_edgetpu.tflite --tpu -p --no-output \
+     -l ../target_detector_labels.txt --sharpen 0.4
    ```
-   Watch for: `onnx_graphsurgeon` version compatibility (last time required bump to 0.6.1); OOM kill from systemd-oomd if memory pressure (mitigated by the 500-image cap).
+   Look for: `[TFLITEMODEL] Loaded from: /home/pi/FullDataSetProdV2_edgetpu.tflite`, `[ALLOCATE] TPU active: True`, `[OUT] shape=(1, 5, 8400)`.
 
-3. **EdgeTPU compile** via TF 2.15 sidecar + flatbuffer surgery — see [[edgetpu-compile-workaround]] memory. Required because TF 2.19 op-versions don't match the EdgeTPU compiler's compat range; the surgery converts grouped `CONV_2D` → `DEPTHWISE_CONV_2D` (version 6 → 3).
+3. **A/B compare V1 vs V2** on the Pi against the same scene/lighting. Capture mean confidence + false-positive rate at the production model `~/FullDataSetProd_edgetpu.tflite` first, then swap to V2 and repeat. Per training-time val deltas (P -0.057, R +0.041, mAP50 same), V2 should fire on slightly more frames at slightly lower per-frame confidence — confirm on real footage.
 
-4. **Deploy to Pi**: scp the resulting `FullDataSetProdV2_edgetpu.tflite` to `~/FullDataSetProdV2_edgetpu.tflite`. Verify hash post-compile. Confirm `[OUT] shape=(1, 5, 8400)` on live inference (raw-head, same as FullDataSetProd).
-
-5. **A/B compare on the Pi**: run the same scene against both models with `--sharpen 0.4` and compare per-frame confidence + false-positive rate. Decide whether to keep V2 or stay on V1.
+4. **Decide V1 vs V2 for competition deployment.** Field check the autonomous scripts (`tf_live_inferenceV2_final_auto.py`) against V2 if it wins the A/B.
 
 **Key context for resume:**
-- `--sharpen 0.4` is the production preproc recipe — applies identically to V2.
-- `tf_live_inferenceV2_final_auto.py` is model-agnostic and will run V2 by swapping the model path; no script changes needed.
+- `--sharpen 0.4` is the production preproc recipe — applies identically to V2 (preproc is model-agnostic).
+- `tf_live_inferenceV2_final_auto.py` and all V2 scripts are model-agnostic — swap the model path on invocation; no script edits needed.
+- V1's artifact lives on the Pi at `~/FullDataSetProd_edgetpu.tflite`. There is NO local copy of V1's compiled EdgeTPU artifact (was deployed straight from `export/FullDataSetProd_saved_model/FullDataSetProd_full_integer_quant_edgetpu.tflite`, which still exists in the saved_model dir).
 - The 990-image scene cluster is the dominant feature in train.txt; val (745 images) is "all other scenes" and a pessimistic benchmark.
 
-**To resume:** re-invoke me and say *"continue from the int8 export"*. I'll pick up at Task #12 (build calib subset) and auto-progress through 13 (export) + 14 (TPU compile).
+**To resume:** re-invoke me and say *"deploy V2 to Pi"* or *"continue with the A/B compare"*. The artifact `export/FullDataSetProdV2_edgetpu.tflite` (sha256 `4a36c548…`) is the deployable file.
 
-**Earlier 2026-05-16 session (final_auto build) — still applies: `tf_live_inferenceV2_final_auto.py` is ready for first Pi BLANK-mode run with whatever model is currently deployed (FullDataSetProd until V2 ships).**
+**Earlier 2026-05-16 session (final_auto build) — still applies: `tf_live_inferenceV2_final_auto.py` is ready for first Pi BLANK-mode run with whichever model wins the A/B.**
 
 ---
 

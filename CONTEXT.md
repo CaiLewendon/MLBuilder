@@ -1,8 +1,51 @@
 # Deployment Context (Deep State Snapshot)
 
-## 2026-05-17 Session Addendum — `FullDataSetProdV2` TRAINED (export pipeline interrupted; resume here)
+## 2026-05-17 Session Addendum (continued) — `FullDataSetProdV2` FULL PIPELINE COMPLETE; EdgeTPU artifact READY for Pi deploy
 
-### Headline
+### Headline (post-resume)
+After the morning interruption, the export pipeline ran clean. `FullDataSetProdV2` is fully through int8 → EdgeTPU. Deployable artifact at `export/FullDataSetProdV2_edgetpu.tflite` (3.05 MiB, sha256 `4a36c548031f746776e4ff6e90b8fe521fb6cc44673fbc5c7fb5fcc951925259`). Pi deploy + A/B compare against V1 is the only remaining step.
+
+### What ran post-resume
+| Step | Tool | Wall time | Result |
+|---|---|---|---|
+| Build calib_subset_500.txt + data_calib_subset.yaml | `shuf -n 500 --random-source=<(yes 42)` | ~1 s | deterministic 500-line subset |
+| `yolo export … int8=True` | venv (TF 2.19) | 2034.5 s (~34 min) | 5 TFLite variants in `export/FullDataSetProdV2_saved_model/` |
+| Build calib NPY (NCHW float32) | `build/build_calib_npy.py` | ~30 s | `build/calib_500x3x640x640_float32_v2.npy` (2.3 GB) |
+| Reinstall TF 2.15 in venv-tf215 | uv pip install | ~5 s | venv had drifted to 2.19; pinned back to 2.15.0 |
+| TF 2.15 sidecar int8 conversion | `build/convert_int8_tf215.py` | ~5.5 min | `FullDataSetProdV2_full_integer_quant_tf215.tflite` (2.94 MB) |
+| Grouped CONV_2D → DEPTHWISE surgery | `build/surgery_grouped_to_depthwise.py` | ~1 s | 1 op converted (subgraph 0, op 145, filter `(128,3,3,1)` input_C=128 — same coordinate as V1) → `_dwfix.tflite` |
+| CONV_2D op-code version 6→3 | `build/downgrade_conv2d_version.py` (new) | ~1 s | `_dwfix_v3.tflite` (2.81 MiB, sha256 `7f81384e…`); smoke-tested `tf.lite.Interpreter` ✓ output `(1, 5, 8400)` int8 |
+| `edgetpu_compiler 16.0` | edge-tpu compile | 980 ms | 132 ops on EdgeTPU / 211 on CPU; 1.27 MiB on-chip cache used; → `FullDataSetProdV2_edgetpu.tflite` |
+| Promote to clean filename | `cp` | — | `export/FullDataSetProdV2_edgetpu.tflite` sha256 `4a36c548…` |
+
+### Final artifacts
+| File | Size | sha256 | Notes |
+|---|---|---|---|
+| `export/FullDataSetProdV2.pt` | 5.45 MB | `d7ad6f99…` | trained weights |
+| `export/FullDataSetProdV2_saved_model/FullDataSetProdV2_full_integer_quant_dwfix_v3.tflite` | 2.81 MiB | `7f81384e314b08984578281313902931136b5c8e374bb2c161af7a3d26160e6a` | pre-compile compat TFLite (byte-stable; recompile reproducible) |
+| `export/FullDataSetProdV2_edgetpu.tflite` | 3.05 MiB | `4a36c548031f746776e4ff6e90b8fe521fb6cc44673fbc5c7fb5fcc951925259` | **deployable EdgeTPU artifact** |
+| `build_FullDataSetProdV2_int8_export.log` | — | — | full yolo export console |
+| `build_FullDataSetProdV2_tf215_convert.log` | — | — | TF 2.15 conversion console |
+| `build_FullDataSetProdV2_surgery.log` | — | — | grouped→depthwise surgery output |
+| `build_FullDataSetProdV2_v3.log` | — | — | version downgrade output |
+| `build_FullDataSetProdV2_edgetpu_compile.log` | — | — | edgetpu_compiler summary |
+
+### Build helpers — now parameterized
+- `build/build_calib_npy.py LIST OUT` (sys.argv 1-2; defaults preserved for V1)
+- `build/convert_int8_tf215.py SAVED_MODEL OUT CALIB_NPY` (sys.argv 1-3; defaults preserved for V1)
+- `build/surgery_grouped_to_depthwise.py IN OUT` (already parameterized; unchanged)
+- `build/downgrade_conv2d_version.py IN OUT` (new this session)
+- Pattern enables any future retrain to reuse the entire pipeline by just swapping paths.
+
+### Remaining steps (Pi-side, separate machine)
+1. `scp export/FullDataSetProdV2_edgetpu.tflite pi@<PI>:~/FullDataSetProdV2_edgetpu.tflite`
+2. `ssh pi 'sha256sum ~/FullDataSetProdV2_edgetpu.tflite'` should print `4a36c548…`
+3. Live-verify: `python -B tf_live_inferenceV2.py ~/FullDataSetProdV2_edgetpu.tflite --tpu -p --no-output -l ../target_detector_labels.txt --sharpen 0.4`. Expect `[ALLOCATE] TPU active: True`, `[OUT] shape=(1, 5, 8400)`.
+4. A/B against V1 (`~/FullDataSetProd_edgetpu.tflite`) on the same scene. Per training-time deltas: V2 should fire on slightly more frames at slightly lower per-frame conf.
+
+### Original pre-resume session summary (kept below for full audit trail)
+
+### Headline (pre-resume)
 New training run on a fresh Label Studio export. `FullDataSetProdV2` (yolo11n, 40 epochs) is trained and the `best.pt` is promoted to `export/FullDataSetProdV2.pt`. **int8 TFLite export and EdgeTPU compile are NOT YET DONE** — those are the next two steps when this work resumes.
 
 ### Dataset
