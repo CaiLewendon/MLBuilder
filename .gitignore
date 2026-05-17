@@ -1,6 +1,7 @@
 # Label Studio dataset exports (raw + unzipped) — too large for GitHub (>100 MB)
 project-1-at-*.zip
 project-1-at-*/
+downloadedUpdatedProductiondata/
 *.zip
 
 # Byte-compiled / optimized / DLL files

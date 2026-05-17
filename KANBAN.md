@@ -1,5 +1,33 @@
 # Kanban
 
+## In Progress (2026-05-17 — `FullDataSetProdV2` TRAINED on `downloadedUpdatedProductiondata`; int8 export + EdgeTPU compile PENDING)
+
+### What's done
+- New Label Studio export landed at `downloadedUpdatedProductiondata/` (3727 images, single class "Target", ~7% more than the prior 3487-image FullDataSetProd set).
+- Scene-aware split (`test/prepare_dataset_split.py`, seed=42): **2982 train / 745 val**, 1027 clusters, 802 singletons, 990-image dominant cluster preserved in train.
+- GPU recovery: nvidia-smi failed at session start (kernel/driver mismatch after kernel update — `nvidia-driver-550` + `nvidia-driver-580` duplicate). User rebooted; driver 580.142 came back clean. Training proceeded on RTX 3070 Laptop.
+- Trained `yolo11n.pt` → `FullDataSetProdV2` for 40 epochs, batch=20, imgsz=640 (same recipe as FullDataSetProd). Wall time **0.282 hours (~17 min)**.
+- Final val on `best.pt`: **P=0.899, R=0.891, mAP50=0.947, mAP50-95=0.646** vs FullDataSetProd's P=0.956, R=0.85, mAP50=0.951, mAP50-95=0.719. Higher recall, lower precision + bbox-localization quality, net mAP50 ~same.
+- Promoted `best.pt` → `export/FullDataSetProdV2.pt` (sha256 `d7ad6f995bbf52d164caa88c612c17e93c2c4fae626f75d41a841915692894e0`). Ultralytics again ignored `project=build/out` and wrote to `~/Documents/MLBuilder/runs/detect/build/out/FullDataSetProdV2/` — same gotcha as before.
+
+### What's pending (resume here)
+1. **Build 500-image calibration subset** (OOM-safe per the int8-calibration-cap memory): seeded `shuf` to `calib_subset_500.txt` + `data_calib_subset.yaml`. ~30 seconds.
+2. **int8 TFLite export** via `venv/bin/yolo export ... format=tflite int8=True data=...`. ~35 min wall time per prior session. Pre-emptively bump `onnx_graphsurgeon` if `AttributeError: float32_to_bfloat16` shows up.
+3. **EdgeTPU compile** via TF 2.15 sidecar + flatbuffer surgery (grouped CONV_2D → DEPTHWISE_CONV_2D version 6 → 3). Per the edgetpu-compile-workaround memory.
+4. **Pi deployment** as `~/FullDataSetProdV2_edgetpu.tflite` (backup V1 first, do not overwrite — both should coexist for A/B comparison).
+5. **A/B compare on Pi** with `--sharpen 0.4` on the same scene. Decide whether to keep V2 or roll back to V1.
+
+### How to resume
+Re-invoke and say "continue the FullDataSetProdV2 export pipeline" or "continue from the int8 export". I'll pick up at Step 1 and auto-progress through Steps 2–4 with status updates at each phase.
+
+### Open consideration
+- "Same or even better" — V2 used the proven yolo11n recipe. If V2's lower precision causes too many false positives in field testing, a parallel `FullDataSetProdV2s` run (yolo11s base, ~3× params, ~40 min train) is the next lever.
+
+### Out of scope of this training run
+- Model retraining for actual Task 2 targets (purple/blue paper circles dyed with cabbage juice) — the `downloadedUpdatedProductiondata` export still appears to be white-plate targets; a separate dataset of dyed paper circles is needed before competition.
+
+---
+
 ## Done (2026-05-16 evening — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2; compile-clean, READY FOR FIRST PI BLANK-MODE RUN)
 
 ### Combined-mission engagement script

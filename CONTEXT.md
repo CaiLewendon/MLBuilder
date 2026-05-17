@@ -1,5 +1,129 @@
 # Deployment Context (Deep State Snapshot)
 
+## 2026-05-17 Session Addendum — `FullDataSetProdV2` TRAINED (export pipeline interrupted; resume here)
+
+### Headline
+New training run on a fresh Label Studio export. `FullDataSetProdV2` (yolo11n, 40 epochs) is trained and the `best.pt` is promoted to `export/FullDataSetProdV2.pt`. **int8 TFLite export and EdgeTPU compile are NOT YET DONE** — those are the next two steps when this work resumes.
+
+### Dataset
+- Source: `downloadedUpdatedProductiondata/` (fresh "YOLO with Images" export from Label Studio)
+- **3727 images** (~7% more than the prior 3487-image `FullDataSetProd` export)
+- Single class "Target", 1920×1080
+- Same notes.json format as before (`{"id": 0, "name": "Target"}`)
+
+### Scene-aware split (same algorithm as before)
+- Tool: `test/prepare_dataset_split.py --dataset downloadedUpdatedProductiondata --val-ratio 0.2 --hash-threshold 5 --seed 42`
+- Method: dhash (64-bit) → union-find by Hamming distance ≤ 5 → largest-first balanced bin packing
+- Result: **2982 train / 745 val** (exact 80/20), 1027 clusters, 802 singletons
+- The 990-image near-stationary camera cluster is still present and kept whole in train (same as FullDataSetProd). val (745 images, all other scenes) is again a pessimistic benchmark.
+
+### GPU recovery (pre-training)
+- nvidia-smi failed at session start — NVML couldn't initialize despite kernel modules being loaded. Both `nvidia-driver-550` (server) and `nvidia-driver-580` (regular) were installed — duplicate-package conflict after a kernel update.
+- User rebooted. Post-reboot: `nvidia-smi` returned `NVIDIA GeForce RTX 3070 Laptop GPU, 7494 MiB free, driver 580.142`. PyTorch's `torch.cuda.is_available()` → True. Training proceeded normally.
+- **Recovery procedure for future sessions:** if `nvidia-smi` fails after a kernel update, reboot first. If reboot doesn't fix it, `sudo apt purge nvidia-driver-550` should clear the duplicate-driver state (driver-580 is the newer, working metapackage).
+
+### Training (yolo11n base, matches FullDataSetProd hyperparams)
+- Command:
+  ```bash
+  venv/bin/yolo detect train model=yolo11n.pt \
+    data=downloadedUpdatedProductiondata/data.yaml \
+    imgsz=640 epochs=40 batch=20 \
+    project=build/out name=FullDataSetProdV2
+  ```
+- Resolved hyperparams: AdamW (auto-selected), lr=0.002, momentum=0.9, AMP, default augmentations
+- Wall time: **0.282 hours (~17 min)** on RTX 3070 Laptop (same hardware as FullDataSetProd, ~16 min)
+- **Final val (best.pt): P=0.899, R=0.891, mAP50=0.947, mAP50-95=0.646**
+
+### Comparison to FullDataSetProd (the currently deployed model)
+| Metric | FullDataSetProdV2 (new) | FullDataSetProd (deployed) | Delta |
+|---|---|---|---|
+| Precision | 0.899 | 0.956 | -0.057 |
+| Recall | 0.891 | 0.85 | **+0.041** |
+| mAP50 | 0.947 | 0.951 | ~same |
+| mAP50-95 | 0.646 | 0.719 | -0.073 |
+
+**Interpretation:** V2 trades precision and bbox-localization quality for recall. Net mAP50 is essentially identical. Real-world effect on Pi inference is unknown until field-tested against the same scene. The user has the option to defer the deploy and stay on V1 if A/B testing on the Pi shows V2 has too many false positives.
+
+### ⚠️ Ultralytics ignored `project=build/out` (same gotcha as FullDataSetProd)
+- Training output landed in `/home/caile/Documents/MLBuilder/runs/detect/build/out/FullDataSetProdV2/` (note: NOT in `aerospace2025-26/`).
+- `~/.config/Ultralytics/settings.json`'s `runs_dir` override is still in effect.
+- Manually promoted: `cp /home/caile/Documents/MLBuilder/runs/detect/build/out/FullDataSetProdV2/weights/best.pt export/FullDataSetProdV2.pt`.
+
+### Artifacts on disk (current state)
+| File | Size | sha256 (full) | Notes |
+|---|---|---|---|
+| `export/FullDataSetProdV2.pt` | 5.45 MB | `d7ad6f995bbf52d164caa88c612c17e93c2c4fae626f75d41a841915692894e0` | promoted from training run |
+| `export/FullDataSetProdV2_last.pt` | 5.45 MB | (not recorded) | last-epoch weights |
+| `downloadedUpdatedProductiondata/train.txt` | — | — | 2982 entries |
+| `downloadedUpdatedProductiondata/val.txt` | — | — | 745 entries |
+| `downloadedUpdatedProductiondata/calib_all.txt` | — | — | 3727 entries (full set; for later subset) |
+| `downloadedUpdatedProductiondata/data.yaml` | — | — | train/val refs |
+| `downloadedUpdatedProductiondata/data_calib.yaml` | — | — | calibration refs |
+| `build_FullDataSetProdV2_train.log` | — | — | full Ultralytics console output |
+
+### What still needs to happen (RESUME HERE next session)
+
+**Step 1: Build the 500-image calibration subset** (OOM-safe per the [[int8-calibration-cap]] memory; without this, exporting against the full 3727-image set will OOM-kill on the 16 GB laptop):
+```bash
+cd downloadedUpdatedProductiondata && \
+shuf -n 500 --random-source=<(yes 42) calib_all.txt > calib_subset_500.txt
+# Then create data_calib_subset.yaml:
+cat > data_calib_subset.yaml <<EOF
+path: /home/caile/Documents/aerospace2025-26/MLBuilder/downloadedUpdatedProductiondata
+train: calib_subset_500.txt
+val: calib_subset_500.txt
+
+names:
+  0: Target
+EOF
+```
+
+**Step 2: Run int8 TFLite export** (~35 min wall time per prior session; pre-emptively `pip install --upgrade onnx_graphsurgeon` if you see `AttributeError: module 'onnx.helper' has no attribute 'float32_to_bfloat16'`):
+```bash
+venv/bin/yolo export model=export/FullDataSetProdV2.pt format=tflite int8=True \
+  data=downloadedUpdatedProductiondata/data_calib_subset.yaml imgsz=640 \
+  2>&1 | tee build_FullDataSetProdV2_int8.log
+```
+- Watch for `_full_integer_quant.tflite` (int8 IO) in `export/FullDataSetProdV2_saved_model/`.
+- Output shape will be `(1, 5, 8400)` (raw head, `nms=False` default).
+- Verify with `python3 -c "import tflite_runtime.interpreter as i; ..."` or just check `[OUT] shape=...` on live inference.
+
+**Step 3: EdgeTPU compile via TF 2.15 sidecar + flatbuffer surgery** (per the [[edgetpu-compile-workaround]] memory). Required because TF 2.19 emits op-versions outside the EdgeTPU compiler's compat range; surgery converts grouped `CONV_2D` → `DEPTHWISE_CONV_2D` (version 6 → 3).
+- The exact workaround procedure is recorded in the memory file. The output is `FullDataSetProdV2_edgetpu.tflite` in `export/FullDataSetProdV2_saved_model/`.
+
+**Step 4: Pi deployment**:
+```bash
+# BACK UP the deployed V1 model first
+ssh pi 'cp ~/FullDataSetProd_edgetpu.tflite ~/FullDataSetProd_edgetpu.tflite.V1_BACKUP'
+# Copy V2 alongside V1 (don't overwrite — A/B testable)
+scp export/FullDataSetProdV2_saved_model/FullDataSetProdV2_full_integer_quant_edgetpu.tflite \
+    pi@<PI>:~/FullDataSetProdV2_edgetpu.tflite
+# Verify hash on Pi
+ssh pi 'sha256sum ~/FullDataSetProdV2_edgetpu.tflite'
+```
+
+**Step 5: A/B compare on the Pi** with the same scene + `--sharpen 0.4`:
+```bash
+# V1 (deployed baseline)
+python3 -B tf_live_inferenceV2.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+# V2 (new)
+python3 -B tf_live_inferenceV2.py ~/FullDataSetProdV2_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+```
+Compare:
+- Per-frame confidence on the same target
+- False-positive rate on clutter
+- Behavior on the actual Task 2 target color (purple paper circle) — V2 might still not handle this if both were trained on white plate; the dataset itself needs new color samples for that.
+
+### To resume next session
+Re-invoke me and say *"continue the FullDataSetProdV2 export pipeline"* or *"continue from the int8 export"*. I'll pick up at Step 1 above and auto-progress through 2, 3, 4 with status notifications at each phase. Expected total wall time from resume: ~35 min export + ~5 min TPU compile + a few minutes for the Pi scp + hash check.
+
+### Open question for the user (when convenient)
+- The model is "the same recipe" — should we ALSO try `yolo11s` (~3× params, ~30-45 min train, often better accuracy at small-target detection) as a parallel experiment before deploying V2? Could run as a separate branch / output name (`FullDataSetProdV2s`) without losing V2.
+
+---
+
 ## 2026-05-16 Late Session Addendum — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2
 
 ### Headline

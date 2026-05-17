@@ -1,6 +1,66 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-16 evening — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2; compile-clean, READY FOR FIRST PI BLANK-MODE RUN)
+## ⏸ WHERE WE LEFT OFF (2026-05-17 — `FullDataSetProdV2` TRAINED + WEIGHTS PROMOTED; int8 export + EdgeTPU compile NOT YET DONE)
+
+**Session summary:**
+- User provided new Label Studio export: `downloadedUpdatedProductiondata/` (3727 images, single class "Target", ~7% larger than the prior 3487-image FullDataSetProd dataset). Same Label Studio "YOLO with Images" format.
+- Ran `test/prepare_dataset_split.py --dataset downloadedUpdatedProductiondata --val-ratio 0.2 --hash-threshold 5 --seed 42` → **2982 train / 745 val**. 1027 clusters, 802 singletons, largest cluster 990 images (same near-stationary camera sequence as before — kept whole in train).
+- GPU was inaccessible (kernel-vs-driver mismatch — duplicate `nvidia-driver-550` + `nvidia-driver-580` installed). User rebooted; driver 580.142 came back clean, RTX 3070 Laptop online, 7.4 GB free.
+- Trained `yolo11n.pt` → `FullDataSetProdV2` for 40 epochs, batch=20, imgsz=640 — **same recipe as FullDataSetProd**. Wall time **0.282 hours (~17 min)**. AdamW auto-selected (lr=0.002, momentum=0.9). Ultralytics again ignored `project=build/out` and wrote to `~/Documents/MLBuilder/runs/detect/build/out/FullDataSetProdV2/`.
+
+**Training results (val on best.pt):**
+| Metric | FullDataSetProdV2 (new) | FullDataSetProd (prior, deployed) | Delta |
+|---|---|---|---|
+| Precision | 0.899 | 0.956 | -0.057 |
+| Recall | 0.891 | 0.85 | **+0.041** |
+| mAP50 | 0.947 | 0.951 | ~same |
+| mAP50-95 | 0.646 | 0.719 | -0.073 |
+
+Higher recall, slightly lower precision and bbox-localization quality. Net mAP50 essentially identical. Field validation needed to judge real-world effect.
+
+**Artifacts on disk:**
+- `export/FullDataSetProdV2.pt` (5.45 MB, sha256 `d7ad6f995bbf52d164caa88c612c17e93c2c4fae626f75d41a841915692894e0`)
+- `export/FullDataSetProdV2_last.pt` (5.45 MB)
+- `downloadedUpdatedProductiondata/train.txt` (2982 entries)
+- `downloadedUpdatedProductiondata/val.txt` (745 entries)
+- `downloadedUpdatedProductiondata/calib_all.txt` (3727 entries — for later subset)
+- `downloadedUpdatedProductiondata/data.yaml` and `data_calib.yaml`
+- `build_FullDataSetProdV2_train.log` (full training console output)
+
+**REMAINING STEPS (next session — resume here):**
+
+1. **Build 500-image calibration subset** (OOM-safe per [[int8-calibration-cap]]):
+   ```bash
+   cd downloadedUpdatedProductiondata && \
+   shuf -n 500 --random-source=<(yes 42) calib_all.txt > calib_subset_500.txt
+   # Write data_calib_subset.yaml referencing calib_subset_500.txt
+   ```
+
+2. **Export to int8 TFLite** (~35 min wall time per prior session):
+   ```bash
+   venv/bin/yolo export model=export/FullDataSetProdV2.pt format=tflite int8=True \
+     data=downloadedUpdatedProductiondata/data_calib_subset.yaml imgsz=640
+   ```
+   Watch for: `onnx_graphsurgeon` version compatibility (last time required bump to 0.6.1); OOM kill from systemd-oomd if memory pressure (mitigated by the 500-image cap).
+
+3. **EdgeTPU compile** via TF 2.15 sidecar + flatbuffer surgery — see [[edgetpu-compile-workaround]] memory. Required because TF 2.19 op-versions don't match the EdgeTPU compiler's compat range; the surgery converts grouped `CONV_2D` → `DEPTHWISE_CONV_2D` (version 6 → 3).
+
+4. **Deploy to Pi**: scp the resulting `FullDataSetProdV2_edgetpu.tflite` to `~/FullDataSetProdV2_edgetpu.tflite`. Verify hash post-compile. Confirm `[OUT] shape=(1, 5, 8400)` on live inference (raw-head, same as FullDataSetProd).
+
+5. **A/B compare on the Pi**: run the same scene against both models with `--sharpen 0.4` and compare per-frame confidence + false-positive rate. Decide whether to keep V2 or stay on V1.
+
+**Key context for resume:**
+- `--sharpen 0.4` is the production preproc recipe — applies identically to V2.
+- `tf_live_inferenceV2_final_auto.py` is model-agnostic and will run V2 by swapping the model path; no script changes needed.
+- The 990-image scene cluster is the dominant feature in train.txt; val (745 images) is "all other scenes" and a pessimistic benchmark.
+
+**To resume:** re-invoke me and say *"continue from the int8 export"*. I'll pick up at Task #12 (build calib subset) and auto-progress through 13 (export) + 14 (TPU compile).
+
+**Earlier 2026-05-16 session (final_auto build) — still applies: `tf_live_inferenceV2_final_auto.py` is ready for first Pi BLANK-mode run with whatever model is currently deployed (FullDataSetProd until V2 ships).**
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-16 evening — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2; compile-clean, READY FOR FIRST PI BLANK-MODE RUN)
 
 **Session summary:**
 - Built `test/tf_live_inferenceV2_final_auto.py` (2821 lines) — combines drone_auto + gimbal_auto into a single sequential one-shot **Task 2 Fire Extinguishing** engagement script.
