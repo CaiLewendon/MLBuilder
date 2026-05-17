@@ -1,5 +1,93 @@
 # Deployment Context (Deep State Snapshot)
 
+## 2026-05-16 Session Addendum — Input Preprocessing Flags + Detection Regression Diagnosis
+
+### TL;DR
+Detection confidence on the Pi had collapsed from prior 0.85-0.92 down to 0.05-0.30 on the same scene + target + model. Root cause: **lighting** (local contrast on the target). Flashlight pointed at target restored confidence to 0.85 with no visible change to the human eye. Software workaround landed in all three V2 scripts: `--sharpen 0.4` alone gives consistent 0.74-0.80 confidence on this scene.
+
+### Diagnostic ladder (use in this order for future regressions)
+1. **Hash the deployed model** — `sha256sum ~/FullDataSetProd_edgetpu.tflite` must match `3d599378240246a660d707839aee6506bfaa44b1e135a354fc13b04dfda0d3f3`. Confirmed correct this session.
+2. **Verify source RTSP feed health** independent of inference — `gst-launch-1.0 rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! rtpjitterbuffer latency=200 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false`. Watch for sustained FPS and zero drops. Confirmed clean this session: 30 fps display, 0 drops, ~4.3 Mbit/s, low jitter. Note: source now negotiates `framerate=60/1` at the RTSP level (was 30 fps historically) — no functional impact since the decode resamples to 30 fps for inference.
+3. **Add light** — handheld flashlight on the target. If confidence recovers, the issue is illumination.
+4. Only if (1)-(3) inconclusive: suspect script/wrapper/quant.
+
+### Why lighting matters this much
+- Target is ~120×113 px white plate at 1080p → ~38 px after wrapper letterboxes to 640×640.
+- YOLO confidence is sigmoid over logits; logit shift of ~2.6 → probability 0.30 vs 0.85. Tiny model-space change, huge probability swing.
+- 8-stop camera + 8-bit H.264 + int8 model has nothing close to the human eye's local adaptation. A scene that looks identical to you can differ by 10-30% on the target's edge gradients.
+- Auto-exposure on the camera adapts to ambient lighting differently across sessions. A blown-out ceiling bulb forces AE to underexpose the rest of the frame; the target (in shadow) loses edge contrast.
+
+### Preprocessing flags landed
+Added to all three V2 scripts: `tf_live_inferenceV2.py`, `tf_live_inferenceV2_gimbal_auto.py`, `tf_live_inferenceV2_drone_auto.py`. Helpers placed next to existing `apply_clahe_bgr`:
+
+| Helper | Effect |
+|---|---|
+| `apply_grayscale_bgr(frame)` | BGR → GRAY → BGR (3 channels for model compat) |
+| `apply_luminance_bgr(frame, factor)` | LAB L-channel multiplier |
+| `apply_contrast_bgr(frame, factor)` | Linear contrast around mid-gray 128 |
+| `apply_saturation_bgr(frame, factor)` | HSV S-channel multiplier |
+| `apply_unsharp_bgr(frame, amount, sigma)` | Unsharp mask via Gaussian blur |
+| `apply_preproc(frame, args)` | Master — runs all enabled steps in order |
+
+CLI flags (all default to no-op; existing behavior preserved):
+- `--grayscale` (toggle)
+- `--luminance` (default 1.0)
+- `--contrast` (default 1.0)
+- `--saturation` (default 1.0)
+- `--sharpen` (default 0.0)
+- `--sharpen-sigma` (default 1.0)
+
+Startup banner: `[PREPROC] sharpen=0.40(sigma=1.0)` (or `[PREPROC] (none — defaults)` when no flags). Pipe-delimited; reports CLAHE in the same line.
+
+Wired into the inference thread via:
+```python
+infer_frame = apply_preproc(frame, args)
+if args.clahe:
+    infer_frame = apply_clahe_bgr(infer_frame, ...)
+```
+
+### Sweep — production recipe is `--sharpen 0.4`
+Same scene + target across all runs (white plate at lower-center, bbox ~(930, 829)→(1050, 942)):
+
+| Recipe | Confidence range | Notes |
+|---|---|---|
+| (no flags, baseline) | 0.20-0.30 | regression visible |
+| `--clahe` | 0.11-0.41 | modest lift, high variance |
+| `--contrast 1.10 --clahe` | 0.20-0.41 | similar to CLAHE alone |
+| `--sharpen 0.3 --sharpen-sigma 1.5` | 0.33-0.67 | wider halo worse for small targets |
+| `--sharpen 0.3 --sharpen-sigma 2.0` | 0.33-0.67 | wider halo worse |
+| `--sharpen 0.3 --clahe` | 0.08-0.26 | **stacking is worse than either alone** |
+| `--sharpen 0.3` | 0.59-0.74 | strong |
+| **`--sharpen 0.4`** | **0.74-0.80** | **production recipe — most consistent** |
+| `--sharpen 0.5` | 0.59-0.85 | similar peak, more variance |
+
+Heavy combos tested early in the sweep destroyed detection:
+- `--grayscale --sharpen 0.7 --contrast 1.25 --luminance 1.15 --saturation 0.6 --clahe`: 1 weak detection per 120 frames, OR model fixated on a 30×30 false positive at the right frame edge (x≈1900 on 1920-wide). Aggressive preprocessing pushes the input distribution too far from the model's training data; halos at frame boundaries get picked up as "edges."
+
+### Production commands (current — applies the recipe)
+```bash
+# Pi inference, production
+python -B tf_live_inferenceV2.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+
+# Autonomous gimbal + fire
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current --live-fire \
+  --sharpen 0.4
+
+# Autonomous drone-movement BLANK-mode Pi test
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4
+```
+
+### Open items / next-session priorities
+1. **Durable lighting fix.** Decide: add fixed task lighting to the demo area (LED panel / work light) OR retrain FullDataSetProd with varied-lighting augmentation. Software preprocessing is a backstop, not a fix.
+2. Pi BLANK-mode validation of `tf_live_inferenceV2_drone_auto.py` (still open from 2026-05-15).
+3. Pi re-validation of the DO_REPEAT_RELAY + COMMAND_ACK gimbal-fire path (still open from 2026-05-14 late).
+4. Field test: drone_auto + gimbal_auto as two processes against the same airframe.
+
+---
+
 ## Operating Topology
 - Source camera stream:
   - RTSP `rtsp://10.42.0.1:8554/front_high`

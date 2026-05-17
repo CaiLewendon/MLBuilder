@@ -1,6 +1,40 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-15 — drone movement script built; NEEDS Pi BLANK-mode + flight test)
+## ⏸ WHERE WE LEFT OFF (2026-05-16 — preprocessing flags landed across all V2 scripts; `--sharpen 0.4` validated as production recipe)
+
+**Session summary:**
+- Diagnosed a detection regression on the Pi: confidence collapsed from prior 0.85-0.92 down to 0.05-0.30 on the same scene + same model (hash verified). Source RTSP feed confirmed healthy (30 fps clean, zero drops, ~4.3 Mbit/s).
+- Root cause: **lighting / local contrast on the target.** Pointing a flashlight at the target (with no visible change to the human eye) restored confidence to 0.85. Mechanism: tiny logit shifts produce huge sigmoid-probability swings on a ~38 px letterboxed target.
+- Added six preprocessing flags to `test/tf_live_inferenceV2.py` (and ported identically to `tf_live_inferenceV2_gimbal_auto.py` and `tf_live_inferenceV2_drone_auto.py`): `--grayscale`, `--luminance`, `--contrast`, `--saturation`, `--sharpen`, `--sharpen-sigma`. All default to no-op so existing behavior is preserved when no flags are passed. Startup banner `[PREPROC] ...` reports the active set.
+- **Sweep result — production recipe is `--sharpen 0.4` alone** (sigma=1.0 default). Consistent 0.74-0.80 confidence. See `[[preproc-sharpen-winner]]` memory.
+- Non-obvious finding: **stacking CLAHE + sharpen is WORSE than either alone** (0.08-0.26 vs 0.59-0.74). Heavy combos (grayscale + saturation 0.6 + sharpen 0.7 + clahe) break detection entirely by shifting input too far from training distribution. See `[[preproc-no-stacking]]`.
+- Source camera framerate is now 60 fps (was documented as 30 fps); H.264-encoded ~4.3 Mbit/s. No issue for inference but worth noting.
+
+**Production commands (current):**
+```bash
+# Pi production inference (laptop-equivalent confidence on dim/varied lighting)
+python -B tf_live_inferenceV2.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+
+# Autonomous gimbal + fire (production recipe applied)
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current --live-fire \
+  --sharpen 0.4
+
+# Autonomous drone-movement BLANK-mode Pi test
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4
+```
+
+**Next-session priorities (unchanged from 2026-05-15, plus this session's adds):**
+1. Pi BLANK-mode test of `tf_live_inferenceV2_drone_auto.py` (autopilot DISARMED, GUIDED mode).
+2. Pi re-validation of the DO_REPEAT_RELAY + COMMAND_ACK gimbal-fire path.
+3. Decide on durable lighting fix: add fixed task lighting to the demo rig vs. retrain FullDataSetProd with varied-lighting augmentation.
+4. Field test combined: drone_auto + gimbal_auto as two processes.
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-15 — drone movement script built; NEEDS Pi BLANK-mode + flight test)
 
 **New artifact this session:** `test/tf_live_inferenceV2_drone_auto.py` (1727 lines). Production drone-positioning script that issues real MAVLink `SET_POSITION_TARGET_LOCAL_NED` velocity setpoints in body frame to an ArduPilot Copter in GUIDED mode. Combines:
 - 4-thread architecture from `tf_live_inferenceV2_gimbal_auto.py` (capture / inference / drone_tx / drone_rx)

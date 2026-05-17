@@ -1,5 +1,48 @@
 # Kanban
 
+## Done (2026-05-16 — input preprocessing flags ported across all V2 scripts; `--sharpen 0.4` validated)
+
+### Detection regression diagnosed and resolved
+Pi inference confidence had collapsed from prior 0.85-0.92 down to 0.05-0.30 on what appeared to be the same scene/target. Diagnostic ladder:
+1. **Model hash verified**: `sha256sum ~/FullDataSetProd_edgetpu.tflite` → `3d599378…` (canonical). Not a model issue.
+2. **Source RTSP feed verified**: standalone `gst-launch-1.0 ... fpsdisplaysink` showed 30 fps clean, 0 dropped frames, ~4.3 Mbit/s, low jitter, no PLI/FIR/NACKs. Not a stream issue. Source is now 60 fps native (was 30 fps historically) — no functional impact but worth noting.
+3. **Lighting diagnosed as root cause**: pointing a flashlight at the target (with no visible change to the human eye) pushed confidence from 0.30 to 0.85. Mechanism: YOLO sigmoid confidence is hypersensitive to local contrast on small (~38 px letterboxed) targets. See [[lighting-dominates-conf]] memory.
+
+### Input preprocessing flags added to all three V2 scripts
+Six new CLI flags wired identically through `test/tf_live_inferenceV2.py`, `tf_live_inferenceV2_gimbal_auto.py`, `tf_live_inferenceV2_drone_auto.py`:
+- `--grayscale` (flag, default off)
+- `--luminance N` (default 1.0 = no-op)
+- `--contrast N` (default 1.0 = no-op)
+- `--saturation N` (default 1.0 = no-op)
+- `--sharpen N` (default 0.0 = no-op)
+- `--sharpen-sigma N` (default 1.0)
+
+Helpers `apply_grayscale_bgr`, `apply_luminance_bgr`, `apply_contrast_bgr`, `apply_saturation_bgr`, `apply_unsharp_bgr`, and master `apply_preproc(frame, args)` added next to existing `apply_clahe_bgr`. Order applied: grayscale → luminance (LAB L) → contrast (mid-gray) → saturation (HSV S) → unsharp mask. Startup banner `[PREPROC] ...` reports active set; prints `[PREPROC] (none — defaults)` when no flags passed. **Behavior identical to pre-patch when no flags are used** — purely additive.
+
+### Sweep result — `--sharpen 0.4` is the production recipe
+Experimental sweep on the same scene/target:
+
+| Recipe | Confidence |
+|---|---|
+| (no preproc, baseline) | 0.20-0.30 |
+| `--clahe` alone | 0.11-0.41 |
+| `--contrast 1.10 --clahe` | 0.20-0.41 |
+| `--sharpen 0.3 --sharpen-sigma 1.5` | 0.33-0.67 (wider halo hurts) |
+| `--sharpen 0.3 --sharpen-sigma 2.0` | 0.33-0.67 (wider halo hurts) |
+| `--sharpen 0.3 --clahe` (stack) | **0.08-0.26 (WORSE than either alone)** |
+| `--sharpen 0.3` | 0.59-0.74 |
+| **`--sharpen 0.4`** | **0.74-0.80 (winner)** |
+| `--sharpen 0.5` | 0.59-0.85 (more variance) |
+
+Heavy combos (`--grayscale --sharpen 0.7 --contrast 1.25 --luminance 1.15 --saturation 0.6 --clahe`) collapsed detection — only 1 hit per 120 frames or model fixated on edge artifacts at the frame boundary (false positive at x≈1900). Aggressive preprocessing shifts the input distribution too far from the model's training data. See [[preproc-no-stacking]].
+
+### Status: ready for production use
+- All three V2 scripts: ✅ compile-clean, ✅ flags exposed in `--help`, ✅ no-op defaults preserve prior behavior
+- Recommended: `scp` the three updated scripts to the Pi, then run with `--sharpen 0.4`
+- Operational guidance: physical lighting on the target is still the strongest signal. Software preprocessing is a backup, not a replacement.
+
+---
+
 ## Done (2026-05-15 — drone-movement script built; NEEDS Pi BLANK-mode + flight test)
 
 New file: `test/tf_live_inferenceV2_drone_auto.py` (1727 lines).

@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-15 01:13:38 PDT
+Generated: 2026-05-16 17:24:32 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,11 +21,11 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                e719ba5e0525eae963d61f52a64d6caac02f0d6e added auto drone script for approach
+* cPCcputestinglocally                0a08dda840e665d42613afd2dad8a1953d13faf0 context update
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally e719ba5e0525eae963d61f52a64d6caac02f0d6e added auto drone script for approach
-  remotes/origin/cTPUtest             714f8c78346f8d84aa6cb8d9d252e1a034af4e24 divyesh is financially iliterate
+  remotes/origin/cPCcputestinglocally 0a08dda840e665d42613afd2dad8a1953d13faf0 context update
+  remotes/origin/cTPUtest             ca44522ed0315ee01d54e6cc6793719085641be1 drone auto code scped
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
 ```
@@ -39,6 +39,9 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
  M CODEX/AILEARN_REPORT.md
  M CONTEXT.md
  M KANBAN.md
+ M test/tf_live_inferenceV2.py
+ M test/tf_live_inferenceV2_drone_auto.py
+ M test/tf_live_inferenceV2_gimbal_auto.py
 
 ```
 
@@ -8195,6 +8198,7 @@ test/__pycache__/pi_mavlink_fullsuite_test.cpython-312.pyc
 test/__pycache__/rebuild_tpu_model_pi.cpython-312.pyc
 test/__pycache__/tf_inference_data_live.cpython-312.pyc
 test/__pycache__/tflite_raw_output_probe.cpython-312.pyc
+test/__pycache__/tf_live_inferenceV2.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_drone_auto.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_gimbal_auto.cpython-312.pyc
 test/__pycache__/tf_live_infrence.cpython-312.pyc
@@ -126035,15 +126039,23 @@ ef719ce | 2026-05-02 |  | it works hell yea
 2f7fd28 | 2026-05-02 |  | removed large frame detections
 6be5cb5 | 2026-05-02 |  | zoom+ratio scaling in smaller frameins for accurate detection plus size restrictions
 8bc66f6 | 2026-05-02 |  | more work done
-714f8c7 | 2026-05-05 |  (origin/cTPUtest) | divyesh is financially iliterate
+714f8c7 | 2026-05-05 |  | divyesh is financially iliterate
 4d5419d | 2026-05-07 |  | Fix TFLite bbox parsing and set working live/gimbal defaults
 593a18a | 2026-05-07 |  | Document working gimbal-sim baseline and session fixes
 9d7c719 | 2026-05-10 |  | added drone movement and alt/ort hold and alignment
 2bb74a2 | 2026-05-10 |  | added mavlink test suite script
 1105e25 | 2026-05-10 |  | updated test suite
+71a220d | 2026-05-12 |  | found the proper command and commented out aspect ratio filtering
+ef4e0a6 | 2026-05-12 |  | found the proper command and commented out aspect ratio filtering
 1fdd0c2 | 2026-05-12 |  | documented and found solutions to proper model training and tflitefiles and command arguments to use to get strong confidence. we must reemvmer its in the context files
+8b40427 | 2026-05-13 |  | added --no-output for no video sends give sgreat performance with no viewing
+2805ebc | 2026-05-14 |  | gimbal control works it just needs tuning and gain control
 0cadeec | 2026-05-14 |  | Autonomous gimbal automation script + V2 inference + EdgeTPU artifacts + docs
+f5b8e26 | 2026-05-14 |  | gimbal works autonomously
 ca5f444 | 2026-05-14 |  | I got hte gimbal autonomy finished
+45850d7 | 2026-05-14 |  | using ack commands for status of firing from firing updated with Do repeat relay mavlink command
 1be6094 | 2026-05-15 |  | do repeat relay command for gimbal fireing and ack command state confirmation
-e719ba5 | 2026-05-15 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | added auto drone script for approach
+ca44522 | 2026-05-15 |  (origin/cTPUtest) | drone auto code scped
+e719ba5 | 2026-05-15 |  | added auto drone script for approach
+0a08dda | 2026-05-15 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | context update
 ```

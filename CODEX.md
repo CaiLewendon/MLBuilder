@@ -360,3 +360,88 @@ Via `MAV_CMD_SET_MESSAGE_INTERVAL` (511):
    ```
 
 4. **Pi RE-VALIDATION of the gimbal fire path** (still pending from prior session — DO_REPEAT_RELAY + COMMAND_ACK-gated state machine). Watch for `[ACK-RELAY] cmd=182 result=0`. If it doesn't arrive, fall back to the DO_SET_RELAY version one git commit earlier.
+
+---
+
+## 2026-05-16 Session — Input preprocessing flags + detection-regression diagnosis
+
+### Symptom
+Pi inference confidence on the white-plate target collapsed from prior 0.85-0.92 down to 0.05-0.30 on what appeared to be the same scene and target. User reported "the image detection is garbage" and noted the stream looked laggy from a third device.
+
+### Diagnostic ladder run
+1. **Model hash** — `sha256sum ~/FullDataSetProd_edgetpu.tflite` returned `3d599378240246a660d707839aee6506bfaa44b1e135a354fc13b04dfda0d3f3`, matching the canonical FullDataSetProd EdgeTPU hash. Model integrity confirmed. Rules out deployment-mismatch.
+2. **Source RTSP feed** — Standalone `gst-launch-1.0 rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! rtpjitterbuffer latency=200 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! fpsdisplaysink video-sink=fakesink text-overlay=false sync=false` showed 30 fps sustained, 0 dropped frames, ~4.3 Mbit/s bitrate, jitter 19-173 (low), no PLI/FIR/NACKs. The source also negotiated `framerate=60/1` natively (was 30 fps historically) — no functional impact since decode resamples to 30 fps. Rules out source/network.
+3. **Visual scene check** — User shared a VLC screenshot. White plate visible at lower-center of frame (the `(930, 829)→(1050, 942)` bbox region). Framed portrait of a person on left shelf identified as the source of the recurring (476-540, 555-585) false positive. Lighting unbalanced — ceiling bulb blown out, target plate in shelf shadow.
+4. **Flashlight test** — User pointed a flashlight at the target. Visible change to human eye: minimal/none. Detection confidence: **jumped from 0.30 to 0.85.** Lighting confirmed as the dominant variable.
+
+### Root cause
+Local contrast on the target. Mechanism:
+- Target ~120×113 px at 1080p → ~38 px after wrapper letterboxes to 640×640.
+- YOLO confidence = sigmoid(logit); logit shift of ~2.6 → probability 0.30 vs 0.85.
+- Human eye has ~20 stops of local dynamic range and adapts per region; camera + H.264 + int8 chain is ~8/8/8 bits with no local adaptation. A scene that looks "the same" to the eye can differ by 10-30% on the target's edge gradients.
+
+### Preprocessing flags added to `tf_live_inferenceV2.py`
+Six CLI flags with no-op defaults:
+- `--grayscale` (toggle)
+- `--luminance N` (default 1.0, LAB L-channel scale)
+- `--contrast N` (default 1.0, linear around mid-gray 128)
+- `--saturation N` (default 1.0, HSV S-channel scale)
+- `--sharpen N` (default 0.0, unsharp-mask amount)
+- `--sharpen-sigma N` (default 1.0, unsharp Gaussian sigma)
+
+Helpers `apply_grayscale_bgr`, `apply_luminance_bgr`, `apply_contrast_bgr`, `apply_saturation_bgr`, `apply_unsharp_bgr`, master `apply_preproc(frame, args)` added next to existing `apply_clahe_bgr`. Wired into the inference thread as `infer_frame = apply_preproc(frame, args)` before the existing CLAHE pass. Startup banner `[PREPROC] ...` reports the active set; defaults print `[PREPROC] (none — defaults)`.
+
+### Empirical sweep
+Initial heavy combo (`--sharpen 0.7 --contrast 1.25 --luminance 1.15 --saturation 0.6 --clahe`) **destroyed** detection: 1 hit per 120 frames; adding `--grayscale` made the model fixate on a 30×30 false positive at the right frame edge (x≈1900 on 1920-wide). Hypothesis: aggressive preprocessing shifts the input distribution far from the model's training data; the model can't have learned to handle multi-stage preprocessing it never saw.
+
+Backed off to single-knob tests on the same scene:
+
+| Recipe | Confidence | Notes |
+|---|---|---|
+| (none, baseline) | 0.20-0.30 | regression visible |
+| `--clahe` | 0.11-0.41 | modest lift, high variance |
+| `--contrast 1.10 --clahe` | 0.20-0.41 | similar to CLAHE alone |
+| `--sharpen 0.3 --sharpen-sigma 1.5` | 0.33-0.67 | wider halo worse for small targets |
+| `--sharpen 0.3 --sharpen-sigma 2.0` | 0.33-0.67 | wider halo worse |
+| `--sharpen 0.3 --clahe` | 0.08-0.26 | **stacking worse than either alone** |
+| `--sharpen 0.3` | 0.59-0.74 | strong |
+| **`--sharpen 0.4`** | **0.74-0.80** | **production recipe** |
+| `--sharpen 0.5` | 0.59-0.85 | similar peak, more variance |
+
+Non-obvious learning: CLAHE + sharpen interferes. CLAHE locally re-equalizes contrast, picks up unsharp halos as gradients, over-corrects. One operation at a time, validated independently, before any stacking.
+
+### Production recipe locked in
+```
+--sharpen 0.4
+```
+(sigma=1.0 default; no other flags.)
+
+### Ported to autonomous scripts
+Same six flags + helpers + banner wired identically into `tf_live_inferenceV2_gimbal_auto.py` and `tf_live_inferenceV2_drone_auto.py`. Both compile clean. Defaults are no-op so prior behavior is preserved.
+
+### Updated production commands
+```bash
+# Pi inference
+python -B tf_live_inferenceV2.py ~/FullDataSetProd_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+
+# Gimbal + fire
+python3 -B tf_live_inferenceV2_gimbal_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --start-from-current --live-fire --sharpen 0.4
+
+# Drone movement (BLANK)
+python3 -B tf_live_inferenceV2_drone_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4
+```
+
+### Open items
+- Durable lighting fix: physical task lighting OR varied-lighting augmentation in the next training round (FullDataSetProd is brittle to lighting because training data was lit uniformly).
+- Pi BLANK-mode validation of `tf_live_inferenceV2_drone_auto.py` still pending from 2026-05-15.
+- Pi re-validation of DO_REPEAT_RELAY + COMMAND_ACK fire path still pending from 2026-05-14 late.
+
+### Memory entries created this session
+- `project_preproc_flags.md` — all three V2 scripts share preprocessing flags
+- `feedback_preproc_sharpen_winner.md` — `--sharpen 0.4` is the operating point
+- `feedback_preproc_no_stacking.md` — don't stack CLAHE + sharpen, single-knob only
+- `feedback_lighting_dominates_conf.md` — diagnose lighting before chasing model/code
+
