@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-16 17:24:32 PDT
+Generated: 2026-05-16 23:44:17 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,10 +21,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                0a08dda840e665d42613afd2dad8a1953d13faf0 context update
+* cPCcputestinglocally                0a754e5ac4cdbcadaa6fec6bcd53dfd91cee6713 Input preprocessing flags across all V2 scripts; --sharpen 0.4 validated
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally 0a08dda840e665d42613afd2dad8a1953d13faf0 context update
+  remotes/origin/cPCcputestinglocally 0a754e5ac4cdbcadaa6fec6bcd53dfd91cee6713 Input preprocessing flags across all V2 scripts; --sharpen 0.4 validated
   remotes/origin/cTPUtest             ca44522ed0315ee01d54e6cc6793719085641be1 drone auto code scped
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
@@ -35,13 +35,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ```text
 ## cPCcputestinglocally...origin/cPCcputestinglocally
  M CLAUDE.md
- M CODEX.md
  M CODEX/AILEARN_REPORT.md
  M CONTEXT.md
  M KANBAN.md
- M test/tf_live_inferenceV2.py
- M test/tf_live_inferenceV2_drone_auto.py
- M test/tf_live_inferenceV2_gimbal_auto.py
+?? test/tf_live_inferenceV2_final_auto.py
 
 ```
 
@@ -8200,6 +8197,7 @@ test/__pycache__/tf_inference_data_live.cpython-312.pyc
 test/__pycache__/tflite_raw_output_probe.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_drone_auto.cpython-312.pyc
+test/__pycache__/tf_live_inferenceV2_final_auto.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_gimbal_auto.cpython-312.pyc
 test/__pycache__/tf_live_infrence.cpython-312.pyc
 test/__pycache__/tf_live_infrence_drone_simulation.cpython-312.pyc
@@ -8210,6 +8208,7 @@ test/tf_inference_data_live.py
 test/tflite_raw_output_probe.py
 test/tf_live_inferenceV2_backup.py
 test/tf_live_inferenceV2_drone_auto.py
+test/tf_live_inferenceV2_final_auto.py
 test/tf_live_inferenceV2_gimbal_auto.py
 test/tf_live_inferenceV2.py
 test/tf_live_infrence_drone_simulation.py
@@ -126057,5 +126056,6 @@ ca5f444 | 2026-05-14 |  | I got hte gimbal autonomy finished
 1be6094 | 2026-05-15 |  | do repeat relay command for gimbal fireing and ack command state confirmation
 ca44522 | 2026-05-15 |  (origin/cTPUtest) | drone auto code scped
 e719ba5 | 2026-05-15 |  | added auto drone script for approach
-0a08dda | 2026-05-15 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | context update
+0a08dda | 2026-05-15 |  | context update
+0a754e5 | 2026-05-16 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | Input preprocessing flags across all V2 scripts; --sharpen 0.4 validated
 ```

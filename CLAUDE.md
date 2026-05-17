@@ -1,6 +1,88 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-16 — preprocessing flags landed across all V2 scripts; `--sharpen 0.4` validated as production recipe)
+## ⏸ WHERE WE LEFT OFF (2026-05-16 evening — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2; compile-clean, READY FOR FIRST PI BLANK-MODE RUN)
+
+**Session summary:**
+- Built `test/tf_live_inferenceV2_final_auto.py` (2821 lines) — combines drone_auto + gimbal_auto into a single sequential one-shot **Task 2 Fire Extinguishing** engagement script.
+- **Mission flow** (owned by inference thread, single source of truth):
+  `PHASE_DRONE_POSITIONING → PHASE_HANDOFF_WAIT → PHASE_GIMBAL_TRACKING → PHASE_FIRING → PHASE_VERIFY → PHASE_HANDBACK → PHASE_DONE`.
+  - DRONE_POSITIONING: drone_auto's 7-state machine drives; gimbal held STATIC at startup angle.
+  - HANDOFF_WAIT: count `--handoff-confirm-frames` (default 15) consecutive FINAL_HOLD frames; reset to 0 on regression.
+  - GIMBAL_TRACKING: drone enters FREEZE (continuous zero-velocity SET_POSITION_TARGET_LOCAL_NED at `--tx-rate` to maintain hover); gimbal slew-rate-limited tracking activates; discharge state machine ticks.
+  - FIRING: 5-second water discharge (DO_REPEAT_RELAY, COMMAND_ACK-gated, same primitive as the gun trigger). Drone stays frozen.
+  - VERIFY: capture 5 frames over 2 s, save best (highest conf, Laplacian-variance fallback) as `Task_2_<team_name>_target_<#>_<ts>.jpg`. Print operator declaration warning.
+  - HANDBACK: `master.set_mode_apm(args.handback_mode)` → LOITER (default), poll for ACK or timeout 2.0 s, send_halt + defensive DO_SET_RELAY OFF, exit.
+- **Single MAVLink master** shared by `MovementLink` and `GimbalLink` via a new `shared_rx_loop(master, drone_link, gimbal_link, on_handback_mode_ack, stop_event)` that dispatches by msg type. Each Link exposes a `handle_message(msg)` extracted from its old `run_rx_loop` body. Justification: pymavlink's `recv_match` is not safe to race across threads on one socket — both source scripts already had one rx thread; we merged them.
+- **6 threads**: main + capture + inference + drone_tx + gimbal_tx + shared_rx. Spawn order: rx → drone_tx → gimbal_tx → cap → inf (rx first so initial telemetry is captured before tx loops gate on `is_guided()`).
+- **Task 2 compliance gate**: `--min-start-distance-cm 200` aborts with exit code 7 if the first DISTANCE_SENSOR reading is < 2 m (Task 2 §5.2.4 requires the autonomous approach to start from >2 m).
+- **CLI namespace resolution**: drone's `--deadband` / `--yaw-gain` renamed to `--drone-deadband` / `--drone-yaw-gain`; gimbal's renamed to `--gimbal-deadband` / `--gimbal-yaw-gain`; gimbal's `--start-from-current` → `--start-from-current-gimbal`; gimbal's one-shot `--center-gimbal` mode → `--center-gimbal-at-start` (mutex with start-from-current; default centers). New: `--handoff-confirm-frames`, `--handback-mode {LOITER,RTL,ALT_HOLD,LAND}`, `--handback-mode-timeout`, `--min-start-distance-cm`, `--team-name`, `--target-number`, `--photo-output-dir`, `--no-photo-capture`, `--capture-frame-count`, `--capture-frame-interval`.
+- **Compile + CLI verified**: `python3 -m py_compile` clean; `--help` exposes all flags; validators reject `--live-fly + --no-mavlink`, `--tx-rate < 4.0`, `--no-fire + --live-fire`, invalid `--handback-mode` choice, `--handoff-confirm-frames 0`.
+- **NOT YET RUN** end-to-end. First test is Pi BLANK-mode with autopilot connected + drone disarmed in GUIDED.
+
+**Pi run commands:**
+```bash
+# Pi BLANK-mode test (autopilot connected, drone disarmed in GUIDED; safest first run)
+python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+  --start-from-current-gimbal --team-name dev_test --target-number 1
+
+# Pi LIVE engagement (observer on RC, GUIDED + armed, drone >2 m from target)
+python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+  --start-from-current-gimbal --live-fly --live-fire \
+  --team-name <team> --target-number 1 \
+  --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \
+  --target-distance-cm 300 --distance-tolerance-cm 30
+
+# Laptop dry-run (no MAVLink, simulated LiDAR; --no-photo-capture skips PHASE_VERIFY)
+venv/bin/python test/tf_live_inferenceV2_final_auto.py \
+  export/project1_prod_saved_model/project1_prod_float16.tflite \
+  -p --video 0 --no-mavlink --overlay \
+  --team-name dev_test --target-number 1 --no-photo-capture
+```
+
+**What to watch for at each phase transition (BLANK-mode logs):**
+```
+[MISSION t=  0.00s] DRONE_POSITIONING -> DRONE_POSITIONING | reason=...   # initial
+[COMPLIANCE OK] start distance Xcm >= 200cm (Task 2 >2m criterion satisfied)
+[STATE   X.XXs] NO_TARGET -> CENTERING ...
+... drone state machine cycles ...
+[STATE   X.XXs] ALTITUDE_ADJUST -> FINAL_HOLD ...
+[MISSION t= X.XXs] DRONE_POSITIONING -> HANDOFF_WAIT | reason=drone reached FINAL_HOLD
+[MISSION t= X.XXs] HANDOFF_WAIT -> GIMBAL_TRACKING | reason=FINAL_HOLD stable for 15 frames
+[BLANK ARMING] sent DO_REPEAT_RELAY(1,cycles=1,period=10.00s); awaiting COMMAND_ACK for cmd=182
+[BLANK ARMED] BLANK simulated ACK after 0.10s; ...
+[MISSION t= X.XXs] GIMBAL_TRACKING -> FIRING | reason=discharge state machine entered FIRING
+[BLANK BURST DONE] 5.00s ON elapsed; ...
+[MISSION t= X.XXs] FIRING -> VERIFY | reason=discharge complete (5.0s); capturing photos
+[VERIFY] captured frame 1/5 (conf=0.812); ...
+[VERIFY] captured frame 5/5 ...
+[VERIFY DECLARED] Photo saved at extinguish_photos/Task_2_dev_test_target_1_<ts>.jpg
+[MISSION t= X.XXs] VERIFY -> HANDBACK | reason=photo captured + saved
+[HANDBACK BLANK] would request mode=LOITER
+[MISSION t= X.XXs] HANDBACK -> DONE | reason=handback timeout / BLANK
+[MISSION DONE] team=dev_test target=1
+```
+
+**Next-session priorities (in order):**
+1. **Pi BLANK-mode run of `tf_live_inferenceV2_final_auto.py`** — autopilot connected, drone DISARMED in GUIDED. Verify full phase progression + photo save + LOITER handback request (will be BLANK log only since no `--live-fly`).
+2. **Mode-loss recovery test** — switch out of GUIDED mid-run; verify `[MODE LOST]` log rate-limited to once per 2 s; switch back to GUIDED, sends resume.
+3. **Conservative LIVE engagement** — observer on RC override; drone >2 m from target; `--live-fly --live-fire` with capped `--max-vx 0.20 --max-vz 0.15`. Confirm LOITER ACK arrives and pilot regains manual control.
+4. **Model retraining for Task 2 targets** — `FullDataSetProd` is trained on white plate; Task 2 targets are purple/blue paper circles 5-30 cm diameter on white backing. Without retraining, detection confidence on the actual competition targets is unverified.
+5. **Field test against Task 2 mockup** — purple paper circle target with cabbage-juice dye; operator flies into search volume manually, engages GUIDED, then runs the script.
+
+**Explicitly out of scope of `final_auto.py`** (separate concerns):
+- GPS waypoint navigation to the building (operator flies manually into search volume per Big City RTM SOPs).
+- Multi-target search across the unknown-count search volume (script handles ONE target per invocation; operator increments `--target-number` and re-runs).
+- Indoor target navigation through the 3.5 m × 3 m doorway.
+- Automatic Google Drive upload (script saves locally; manual upload preserves operator final-confirmation before declaration).
+- Post-extinguish color verification (purple → blue CV check on the bbox) — would reduce false-declaration risk; future enhancement.
+
+**Earlier 2026-05-16 work (preprocessing flags, --sharpen 0.4) is now baked into final_auto as well — all preprocessing flags carried forward identically. See [[preproc-sharpen-winner]], [[preproc-no-stacking]], [[lighting-dominates-conf]].**
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-16 — preprocessing flags landed across all V2 scripts; `--sharpen 0.4` validated as production recipe)
 
 **Session summary:**
 - Diagnosed a detection regression on the Pi: confidence collapsed from prior 0.85-0.92 down to 0.05-0.30 on the same scene + same model (hash verified). Source RTSP feed confirmed healthy (30 fps clean, zero drops, ~4.3 Mbit/s).

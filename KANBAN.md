@@ -1,5 +1,87 @@
 # Kanban
 
+## Done (2026-05-16 evening — `tf_live_inferenceV2_final_auto.py` BUILT for Big City RPAS Task 2; compile-clean, READY FOR FIRST PI BLANK-MODE RUN)
+
+### Combined-mission engagement script
+New file: `test/tf_live_inferenceV2_final_auto.py` (2821 lines). Combines `tf_live_inferenceV2_drone_auto.py` (1904 lines) + `tf_live_inferenceV2_gimbal_auto.py` (1316 lines) into a single one-shot **Big City RPAS Task 2 (Fire Extinguishing)** engagement: drone positions itself >2 m from the target, locks, holds steady, gimbal aims, water solenoid discharges for 5 s, photo captured with Task-2-compliant filename, autopilot switched to LOITER, exit. The two underlying scripts are UNCHANGED.
+
+### Mission flow (7 phases, owner: inference thread)
+```
+PHASE_DRONE_POSITIONING → PHASE_HANDOFF_WAIT → PHASE_GIMBAL_TRACKING → PHASE_FIRING → PHASE_VERIFY → PHASE_HANDBACK → PHASE_DONE
+```
+- **DRONE_POSITIONING**: drone_auto's 7-state machine drives; gimbal held STATIC at startup angle.
+- **HANDOFF_WAIT**: count `--handoff-confirm-frames` (default 15) consecutive FINAL_HOLD frames; reset to 0 on state regression.
+- **GIMBAL_TRACKING**: drone FREEZE (continuous zero-velocity SET_POSITION_TARGET_LOCAL_NED at `--tx-rate` to maintain hover); gimbal slew-rate-limited tracking activates; discharge state machine ticks.
+- **FIRING**: 5-second water discharge (DO_REPEAT_RELAY, COMMAND_ACK-gated). Drone stays frozen.
+- **VERIFY**: capture 5 frames over 2 s, save best (highest confidence; Laplacian-variance fallback) as `Task_2_<team_name>_target_<#>_<ts>.jpg`.
+- **HANDBACK**: `master.set_mode_apm(args.handback_mode)` → LOITER (default; or RTL/ALT_HOLD/LAND). Poll for ACK or `--handback-mode-timeout` 2.0 s. Send_halt + defensive DO_SET_RELAY OFF.
+
+### Architecture
+- **Single MAVLink master** shared by MovementLink + GimbalLink. New `shared_rx_loop(master, drone_link, gimbal_link, on_handback_mode_ack, stop_event)` does the one `master.recv_match` and dispatches by msg type:
+  - HEARTBEAT / DISTANCE_SENSOR / VFR_HUD / LOCAL_POSITION_NED → drone_link.handle_message
+  - RELAY_STATUS → gimbal_link.handle_message
+  - COMMAND_ACK → branch by cmd ID (181/182/205 → gimbal; 176/511/other → drone, with cmd=176 DO_SET_MODE ACK also captured into mission_state for the handback gate)
+- **6 threads**: main + capture + inference + drone_tx + gimbal_tx + shared_rx. Spawn order: rx-first so initial telemetry is captured before tx loops gate on `is_guided()`.
+- **Single source of truth for mission_phase**: inference thread owns transitions; other threads read-only under `mission_lock`.
+- **`do_handback_once()` is idempotent**: first call sends DO_SET_MODE + halt + defensive relay-OFF; subsequent calls poll for ACK or timeout. Called from inference thread per-frame AND from `finally` block.
+
+### Task 2 compliance (rule v1.3 §5.2.4)
+- `--min-start-distance-cm` (default 200) — first valid DISTANCE_SENSOR reading must be >= this; aborts with exit code 7 if violated. Required for the autonomous-extinguishing 20-pt criterion (approach starts from >2 m).
+- `--team-name`, `--target-number`, `--photo-output-dir` — produce `Task_2_<team_name>_target_<#>_<ts>.jpg` per Task 2 §5.2.4(4)(f).
+- `--no-photo-capture` — skip PHASE_VERIFY for testing (NOT Task-2-compliant).
+- `--handback-mode {LOITER,RTL,ALT_HOLD,LAND}` — LOITER (default) hands manual control to pilot for the safe-landing 5 pts; LAND triggers autonomous-landing 5 pts.
+- Operator declaration warning printed in PHASE_VERIFY logs ("visually confirm target turned BLUE before declaring; false-declaration penalty = -P_indoor or -P_outdoor pts").
+
+### CLI namespace resolution
+- `--drone-deadband` / `--drone-yaw-gain` (renamed from drone_auto's `--deadband` / `--yaw-gain`)
+- `--gimbal-deadband` / `--gimbal-yaw-gain` (renamed from gimbal_auto's same)
+- `--start-from-current-gimbal` (renamed for clarity; mutex with `--center-gimbal-at-start`)
+- New mission flags: `--handoff-confirm-frames` (15), `--handback-mode` (LOITER), `--handback-mode-timeout` (2.0), `--min-start-distance-cm` (200), `--team-name`, `--target-number`, `--photo-output-dir`, `--no-photo-capture`, `--capture-frame-count` (5), `--capture-frame-interval` (0.4 s)
+
+### Verified
+- `python3 -m py_compile` clean.
+- `--help` exposes all flags.
+- Validators reject: `--live-fly + --no-mavlink`, `--live-fly + --simulate-distance`, `--no-fire + --live-fire`, `--tx-rate < 4.0`, invalid `--handback-mode` choice, `--handoff-confirm-frames 0`, etc.
+- `--start-from-current-gimbal` correctly suppresses default `--center-gimbal-at-start`.
+
+### Status: ready for first Pi BLANK-mode run
+- **NOT YET RUN end-to-end.** Compile + CLI only.
+- First test: Pi BLANK-mode (autopilot connected, drone DISARMED in GUIDED). Verify full phase progression + photo save + LOITER handback request (BLANK log only since no `--live-fly`).
+
+### Run commands (current)
+```bash
+# Pi BLANK-mode (autopilot connected, drone disarmed in GUIDED) — SAFEST FIRST RUN
+python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+  --start-from-current-gimbal --team-name dev_test --target-number 1
+
+# Pi LIVE engagement (observer on RC, GUIDED + armed, drone >2 m from target)
+python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+  --start-from-current-gimbal --live-fly --live-fire \
+  --team-name <team> --target-number 1 \
+  --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \
+  --target-distance-cm 300 --distance-tolerance-cm 30
+
+# Laptop dry-run (no MAVLink, simulated LiDAR, skip photo for fast iteration)
+venv/bin/python test/tf_live_inferenceV2_final_auto.py \
+  export/project1_prod_saved_model/project1_prod_float16.tflite \
+  -p --video 0 --no-mavlink --overlay \
+  --team-name dev_test --target-number 1 --no-photo-capture
+```
+
+### Out of scope of `final_auto.py` (separate concerns)
+- GPS waypoint navigation to building (operator manual)
+- Multi-target search across the unknown-count search volume (script handles ONE target per invocation; operator re-runs with incremented `--target-number`)
+- Indoor doorway nav (3.5 m × 3 m doorway)
+- Automatic Google Drive upload (script saves locally; manual upload preserves operator visual-confirmation before declaration)
+- Post-extinguish color verification (purple → blue CV check) — future enhancement
+
+### Model retraining gap (open workstream, separate)
+`FullDataSetProd_edgetpu.tflite` is trained on white plate targets per CLAUDE.md. Task 2 targets are **purple/blue paper circles 5-30 cm diameter on white plastic backing** (cabbage-juice dye + baking-soda indicator). Script architecture is model-agnostic, but confidence on actual Task 2 targets is unverified until retrain.
+
+---
+
 ## Done (2026-05-16 — input preprocessing flags ported across all V2 scripts; `--sharpen 0.4` validated)
 
 ### Detection regression diagnosed and resolved
