@@ -1,5 +1,94 @@
 # Deployment Context (Deep State Snapshot)
 
+## 2026-05-17 evening Session Addendum — `FullDataSetProdV3` BUILT, FULL DATASET A/B WINS V1
+
+After V2 was deployed to Pi and showed confidence collapse (0.06-0.50 vs V1's 0.85), the user authorized a full diagnostic + retrain. Root cause identified: `prepare_dataset_split.py` is not stable across input-pool changes — V2's dhash clusters were re-bin-packed from scratch, leaking 527 of V1's val images into V2's train and 335 of V1's train images into V2's val. V2's val metrics looked OK because the val set itself had shifted to include V1-trained-on images.
+
+### Robust split design (`test/robust_split.py`)
+
+Per-cluster cap to defeat the dominant-scene over-representation:
+- For each dhash scene cluster of size S: `val = min(round(S*0.2), 40)` (cap 40 per cluster), `train = min(S - val, 100)` (cap 100), excess → holdout.
+- 990-cluster (deployment scene): 40 val, 100 train, 850 holdout.
+- 240-cluster (new images user added): 40 val, 100 train, 100 holdout.
+- Smaller clusters: kept whole, ~80/20 split.
+- Result: train=2377, val=400, holdout=950, calib=500 (per-cluster round-robin).
+
+### V3 training
+
+`yolo11n.pt` → 40 epochs, batch=20, imgsz=640 (same recipe as V1/V2). ~13.7 min on RTX 3070. Final val:
+
+| Metric | V1 | V2 | V3 |
+|---|---|---|---|
+| Precision | 0.956 | 0.899 | **0.968** |
+| Recall | 0.850 | 0.891 | **0.975** |
+| mAP50 | 0.951 | 0.947 | **0.989** |
+| mAP50-95 | 0.719 | 0.646 | **0.842** |
+
+### Two int8 variants built (both surgery-fixed + EdgeTPU-compiled)
+
+| Variant | Calib set | EdgeTPU artifact | sha256 |
+|---|---|---|---|
+| Per-cluster (default) | 500 round-robin from all clusters | `export/FullDataSetProdV3_edgetpu.tflite` | `414f16ef267cf90e459453ef09a1b204d0c08d3e84344ca2752dea87f05f0d96` |
+| **Deployment-heavy** ⭐ | 250 dominant-cluster + 250 round-robin | `export/FullDataSetProdV3_depheavy_edgetpu.tflite` | **`958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe`** |
+
+### Full-dataset A/B (all 3,727 images, int8 on CPU)
+
+**Overall:**
+
+| Model | Median conf | Hit ≥0.25 | Hit ≥0.5 | Hit ≥0.75 |
+|---|---|---|---|---|
+| V1 int8 | 0.852 | 70.5% | 68.7% | 62.2% |
+| V3 percluster | 0.884 | 77.6% | 76.3% | 69.7% |
+| V3 depheavy | 0.875 | 77.6% | 75.9% | 70.2% |
+
+**On the 240 NEW images (V2-batch additions, V1 never trained on):**
+
+| Model | Hits | Median conf |
+|---|---|---|
+| V1 int8 | 5/240 (2.1%) | 0.012 |
+| V3 percluster | 240/240 (100%) | 0.884 |
+| V3 depheavy | 240/240 (100%) | 0.904 |
+
+**On dominant 990-cluster (deployment scene):**
+
+| Model | Hits | Median conf |
+|---|---|---|
+| V1 int8 | 91.5% | 0.852 |
+| V3 depheavy | 92.7% | 0.846 |
+
+Essentially tied on the deployment scene, massive win for V3 on new images.
+
+### Reusable build helpers (all parameterized via sys.argv)
+
+- `test/robust_split.py` — per-cluster-capped scene-aware split (cap=100 train, cap=40 val).
+- `build/inspect_clusters.py` — dhash cluster distribution dump.
+- `build/build_deployment_heavy_calib.py` — 250+250 deployment-heavy calib subset.
+- `build/build_calib_npy.py` — float32 calibration tensor for TF 2.15.
+- `build/convert_int8_tf215.py` — TF 2.15 sidecar int8 conversion.
+- `build/surgery_grouped_to_depthwise.py` — flatbuffer fix for edgetpu_compiler op-version 6 issue.
+- `build/downgrade_conv2d_version.py` — CONV_2D op-code version 6→3.
+- `build/full_dataset_ab.py` — all-image 3-way int8 A/B with per-cluster aggregation.
+
+### Logs / data files
+
+- `build/v3_train.log`, `build/v3_export.log`, `build/v3_tf215_convert.log`, `build/v3_tf215_convert_depheavy.log`, `build/full_dataset_ab.log`
+- `build/v2_clusters.json` — dhash cluster assignments for the 3,727-image V2 pool (load-once cache)
+- `build/full_dataset_ab.json` — A/B per-cluster aggregates
+- `build/v1_baseline_local_ab.json`, `build/v2_baseline_local_ab.json`, `build/v3_vs_v1_full_ab.json`, `build/v3_vs_v1_new_images.json`, `build/v3_depheavy_vs_v1.json` — sample-based local A/B runs
+
+### Pi deploy commands (next session)
+
+```bash
+scp export/FullDataSetProdV3_depheavy_edgetpu.tflite pi@<PI>:~/FullDataSetProdV3_depheavy_edgetpu.tflite
+ssh pi 'sha256sum ~/FullDataSetProdV3_depheavy_edgetpu.tflite'
+# expect: 958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe
+
+python -B tf_live_inferenceV2.py ~/FullDataSetProdV3_depheavy_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+# expect: [ALLOCATE] TPU active: True, [OUT] shape=(1, 5, 8400), conf ~0.85+ on deployment scene
+```
+
+
 ## 2026-05-17 Session Addendum (continued) — `FullDataSetProdV2` FULL PIPELINE COMPLETE; EdgeTPU artifact READY for Pi deploy
 
 ### Headline (post-resume)

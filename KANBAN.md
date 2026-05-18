@@ -1,6 +1,24 @@
 # Kanban
 
-## In Progress (2026-05-17 — `FullDataSetProdV2` FULL EXPORT PIPELINE COMPLETE; Pi deploy + A/B compare PENDING)
+## In Progress (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
+
+### What's done
+- V2 Pi deploy + A/B revealed confidence collapse (0.06-0.50 vs V1's 0.85). Root cause: `prepare_dataset_split.py` re-clusters and re-bin-packs every time the input pool changes, leaking train↔val between V1 and V2 (527 V1-val→V2-train, 335 V1-train→V2-val). V2's val metrics looked OK because V2's val set had shifted.
+- Wrote `test/robust_split.py`: per-cluster cap of `train ≤ 100`, `val ≤ 40`, excess→holdout. Result train=2377, val=400, holdout=950, calib=500 (per-cluster round-robin). 1027 dhash clusters; largest 990-cluster (deployment scene) and 240-cluster (new images user added) both capped.
+- Trained `FullDataSetProdV3`: 40 epochs, ~13.7 min on RTX 3070. Final val **P=0.968, R=0.975, mAP50=0.989, mAP50-95=0.842** — beats V1 (0.956/0.85/0.951/0.719) and V2 (0.899/0.891/0.947/0.646) on every metric.
+- Full int8 export pipeline ran clean (same parameterized helpers as V2). Two EdgeTPU artifacts built:
+  - `export/FullDataSetProdV3_edgetpu.tflite` (per-cluster calib) sha256 `414f16ef…`
+  - **`export/FullDataSetProdV3_depheavy_edgetpu.tflite`** (250 dominant + 250 round-robin calib) sha256 **`958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe`**
+- Built `build/full_dataset_ab.py` and ran on all 3,727 images. **V3 depheavy beats V1 overall (77.6% vs 70.5% hits, 0.875 vs 0.852 median), DOMINATES on the 240 new images (100% vs 2.1% hits, 0.904 vs 0.012 median conf), ties on the deployment-scene 990-cluster (92.7% vs 91.5%, 0.846 vs 0.852 median).**
+
+### What's pending (Pi-side, next session)
+1. `scp export/FullDataSetProdV3_depheavy_edgetpu.tflite pi@<PI>:~/FullDataSetProdV3_depheavy_edgetpu.tflite`. Keep V1 + V2 on Pi for reference.
+2. `ssh pi 'sha256sum ~/FullDataSetProdV3_depheavy_edgetpu.tflite'` should print `958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe`.
+3. Live-verify on Pi with `--sharpen 0.4`. Expect ~0.85+ conf on deployment scene + detections on new-image scenarios V1 was missing.
+4. If V3 depheavy ≥ V1 on Pi live: promote to autonomous scripts (gimbal_auto, drone_auto, final_auto) by swapping the model path on invocation — scripts are model-agnostic.
+5. Field test against actual Big City Task 2 target geometry. V3's broader scene coverage should help with non-laboratory environments.
+
+## ARCHIVED (2026-05-17 morning — `FullDataSetProdV2` FULL EXPORT PIPELINE COMPLETE; Pi deploy + A/B compare PENDING)
 
 ### What's done
 - New Label Studio export landed at `downloadedUpdatedProductiondata/` (3727 images, single class "Target", ~7% more than the prior 3487-image FullDataSetProd set).

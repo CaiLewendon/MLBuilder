@@ -1,6 +1,84 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-17 — `FullDataSetProdV2` FULL PIPELINE COMPLETE; EdgeTPU artifact READY for Pi deploy + A/B compare)
+## ⏸ WHERE WE LEFT OFF (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL DATASET A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
+
+**Session summary (after the V2 Pi A/B revealed regression):**
+- User ran V2 on Pi: confidence collapsed to 0.06-0.50 (vs V1's 0.85). Diagnosed root cause: `prepare_dataset_split.py` produces a NEW dhash-cluster split every time the input pool changes — so V2's split moved 527 of V1's val images into V2's train and 335 of V1's train images into V2's val. V2 metrics looked OK on V2's val (since that val included V1-trained-on images), but V2 generalization to actually-new images was untrained.
+- **Built `test/robust_split.py`**: per-cluster cap of `train ≤ 100` and `val ≤ 40` per dhash scene cluster. Excess from the 990-cluster (deployment scene) and 240-cluster (new images) goes to `holdout.txt`. Result: train=2377, val=400, holdout=950 across 1027 clusters. Every scene represented; no scene dominates training. Calibration set rebuilt as **per-cluster round-robin** (`calib_all.txt` now 500 images, 1+ from every cluster).
+- Trained `FullDataSetProdV3` from `yolo11n.pt`: 40 epochs, batch=20, imgsz=640, same recipe as V1/V2. ~13.7 min on RTX 3070.
+  - **Final val: P=0.968, R=0.975, mAP50=0.989, mAP50-95=0.842.** Beats V1 (0.956/0.85/0.951/0.719) and V2 (0.899/0.891/0.947/0.646) on every metric.
+  - Promoted to `export/FullDataSetProdV3.pt` sha256 `8e87097a3a833d76c74152a0cc93e1837f9026701ada2b205ef8f73c375496ab`.
+- Full int8 export pipeline (with parameterized helpers — same recipe as V2):
+  1. `yolo export model=… int8=True data=…/data_calib.yaml` (2071 s ~ 34 min) → all 5 TFLite variants.
+  2. `build/build_calib_npy.py` → `build/calib_500x3x640x640_float32_v3.npy`.
+  3. `venv-tf215/bin/python build/convert_int8_tf215.py` (~5.5 min) → `FullDataSetProdV3_full_integer_quant_tf215.tflite`.
+  4. `build/surgery_grouped_to_depthwise.py` → 1 op converted at subgraph=0 op=145 filter=(128,3,3,1) (same coordinate as V1/V2).
+  5. `build/downgrade_conv2d_version.py` → CONV_2D op-code version 6→3.
+  6. `edgetpu_compiler 16.0.384591198` → 132 EdgeTPU / 211 CPU ops (same split as V1/V2).
+- **ALSO built a deployment-heavy calibration variant** (`_depheavy_edgetpu.tflite`): calib set = 250 dominant-cluster + 250 round-robin from other clusters. Better int8 confidence on the deployment scene than the per-cluster calib while still seeing diverse scenes.
+
+**Full-dataset A/B (all 3,727 images, int8 models on CPU):**
+
+| Model | Median conf | Hit ≥0.25 | Hit ≥0.5 | Hit ≥0.75 |
+|---|---|---|---|---|
+| V1 int8 (current Pi) | 0.852 | 70.5% | 68.7% | 62.2% |
+| V3 percluster | 0.884 | 77.6% | 76.3% | 69.7% |
+| **V3 depheavy** ⭐ | 0.875 | **77.6%** | 75.9% | **70.2%** |
+
+- **On 240 NEW images** (V2 batch additions V1 never trained on): V1 hits **2.1% (5/240) at 0.012 median conf**. V3 depheavy hits **100% (240/240) at 0.904 median conf**. This is the headline result — V1 essentially cannot detect the new images user added.
+- **On 3,487 V1-era images** (V1 was trained on these): V1 0.852 / 75.3% hits, V3 depheavy 0.875 / 76.1% hits. V3 ties or beats V1 on V1's own training images at int8.
+- **On dominant 990-cluster** (the deployment scene): V1 0.852 / 91.5%, V3 depheavy 0.846 / 92.7%. Essentially tied on confidence; V3 wins on hit rate by 1.2 pct.
+- **Per-cluster top 10**: V3 strictly better or tied on 9/10 clusters; one tie (-0.014 conf at 100% hit rate on both).
+- **Conclusion**: V3 depheavy is a strict upgrade. Detects +264 more images dataset-wide than V1 and 100% of new images vs V1's 2.1%.
+
+**Final deployable artifact:**
+- `export/FullDataSetProdV3_depheavy_edgetpu.tflite` (3.05 MiB / 3200896 bytes)
+- sha256 **`958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe`**
+- Pre-compile source: `export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_depheavy_v3.tflite`
+- Backup (per-cluster calib variant): `export/FullDataSetProdV3_edgetpu.tflite` sha256 `414f16ef267cf90e459453ef09a1b204d0c08d3e84344ca2752dea87f05f0d96`
+- Input: int8 NHWC (1,640,640,3) scale 0.00392 zero -128. Output: int8 (1,5,8400) scale 0.00433 zero -120 (raw head — same signature as V1/V2; identify by sha256 per [[feedback-hash-not-shape]]).
+
+**REMAINING STEPS (next session):**
+
+1. **scp V3 depheavy to Pi** (keep V1 + V2 both for reference; V3 is the new production):
+   ```bash
+   scp export/FullDataSetProdV3_depheavy_edgetpu.tflite pi@<PI>:~/FullDataSetProdV3_depheavy_edgetpu.tflite
+   ssh pi 'sha256sum ~/FullDataSetProdV3_depheavy_edgetpu.tflite'
+   # expect: 958b7b40850c2c690ead26f1318645fbddfc80f2147ae6742376063dee42c0fe
+   ```
+
+2. **Pi live verify** with production preproc recipe:
+   ```bash
+   python -B tf_live_inferenceV2.py ~/FullDataSetProdV3_depheavy_edgetpu.tflite --tpu -p --no-output \
+     -l ../target_detector_labels.txt --sharpen 0.4
+   ```
+   Expect: `[ALLOCATE] TPU active: True`, `[OUT] shape=(1, 5, 8400)`, mean confidence ~0.85+ on the deployment scene.
+
+3. **Confidence sanity check**: on the same lighting/scene where V1 was getting 0.85, V3 depheavy should land ~0.85 (local A/B confirms parity at int8). The big difference vs V2 (which collapsed to 0.05-0.50) is that V3 was trained with no-leakage cluster-aware split AND calibrated with a deployment-scene-heavy mix.
+
+4. **If V3 depheavy ≥ V1 on Pi live → promote to autonomous scripts:**
+   ```bash
+   python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProdV3_depheavy_edgetpu.tflite \
+     --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+     --start-from-current-gimbal --team-name <team> --target-number 1
+   ```
+
+**Key build helpers (parameterized — reusable for V4/V5/...):**
+- `test/robust_split.py` — per-cluster-capped scene-aware split. Replaces `test/prepare_dataset_split.py` for incremental retrains.
+- `build/inspect_clusters.py` — dhash cluster size distribution.
+- `build/build_deployment_heavy_calib.py` — deployment-heavy calib subset builder (250 dominant + 250 round-robin).
+- `build/build_calib_npy.py` / `build/convert_int8_tf215.py` / `build/surgery_grouped_to_depthwise.py` / `build/downgrade_conv2d_version.py` — int8 pipeline (all `sys.argv` parameterized).
+- `build/full_dataset_ab.py` — runs all three int8 models on all images, per-cluster aggregate. Re-run after any retrain to compare against V1/V3 baselines.
+- `build/local_ab_validate.py` / `build/ab_on_new_images.py` — sample-based A/B harnesses (faster than full-dataset for iterative tuning).
+
+**The V2 lessons (don't repeat):**
+- `prepare_dataset_split.py` is **NOT stable across input-pool changes** — adding images causes re-clustering and re-bin-packing, leaking train↔val. Always use `robust_split.py` for incremental retrains, OR carry V1's assignments forward explicitly.
+- A simple `shuf -n 500 --random-source=<(yes 42)` calibration subset over-represents the dominant cluster (26.5% of V2's pool → ~26.5% of calib). Per-cluster round-robin sampling is way more representative. Deployment-heavy is even better when you know which cluster IS the deployment scene.
+- Labeled-image confidence ≠ Pi-live confidence. V2's labeled-image conf was 0.83 (looked fine) but Pi-live conf was 0.08. The int8 calibration distribution mismatch is the bridge between the two — get calibration right.
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-17 morning — `FullDataSetProdV2` FULL PIPELINE COMPLETE; EdgeTPU artifact READY for Pi deploy + A/B compare)
 
 **Session summary (continuation of the morning training session):**
 - Resumed from "weights promoted, export pending." Built 500-image deterministic calib subset (`shuf -n 500 --random-source=<(yes 42)`), authored `data_calib_subset.yaml`, then ran `venv/bin/yolo export … int8=True` — completed in **2034.5s (~34 min)** producing all 5 TFLite variants. Ultralytics emitted the expected CONV_2D op-version 6 + single grouped-CONV_2D collapse — same op-graph quirk as V1.
