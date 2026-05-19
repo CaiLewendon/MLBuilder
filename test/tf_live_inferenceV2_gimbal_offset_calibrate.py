@@ -1,69 +1,61 @@
 """
-tf_live_inferenceV2_final_auto.py
+tf_live_inferenceV2_gimbal_offset_calibrate.py
 
-Big City RPAS Task 2 (Fire Extinguishing) — combined autonomous engagement.
-Sequential one-shot mission: drone positions, gimbal aims, water discharges,
-photo is captured, autopilot is switched to LOITER, pilot resumes control.
+INTERACTIVE GIMBAL AIM OFFSET CALIBRATION TOOL.
 
-Architecture (single MAVLink master shared by both Link classes):
-  Threads
-    1. capture_thread       : RTSP -> latest_frame (drop-old, single slot)
-    2. inference_thread     : detection + phase-conditional state machines
-                              (owns mission_phase transitions)
-    3. drone_tx_thread      : SET_POSITION_TARGET_LOCAL_NED at --tx-rate Hz
-    4. gimbal_tx_thread     : slew-rate-limited DO_MOUNT_CONTROL at --send-rate Hz
-    5. shared_rx_thread     : ONE recv_match loop; dispatches by msg type to
-                              drone_link.handle_message / gimbal_link.handle_message
-    + main thread           : OSD overlay + optional video writer
+The water gun is mounted right of the camera and pitched differently; the
+water stream is also nudged by propwash. So the autonomous scripts
+(gimbal_auto / final_auto / gimbal_back_up), which drive the gimbal to put
+the target at frame-center, point the gun a few cm right/up of the target —
+and the shot misses. This tool lets you nudge an aim offset interactively,
+fire test rounds, and save the offset to <repo>/gimbal_offset.json so the
+production scripts pick it up automatically on next launch (the loaded value
+is logged at startup; pass --ignore-aim-offset to bypass).
 
-Mission flow
-  PHASE_DRONE_POSITIONING
-      drone-auto 7-state machine runs; gimbal held STATIC at startup angle.
-      First-frame compliance check: first valid DISTANCE_SENSOR reading must be
-      >= --min-start-distance-cm (Task 2 §5.2.4 requires >2 m approach start).
-      When drone state == STATE_FINAL_HOLD: → PHASE_HANDOFF_WAIT.
-  PHASE_HANDOFF_WAIT
-      Count consecutive FINAL_HOLD frames. Reset to 0 if state regresses.
-      When count >= --handoff-confirm-frames: → PHASE_GIMBAL_TRACKING.
-  PHASE_GIMBAL_TRACKING
-      Drone enters FREEZE (continuous zero-velocity setpoints at --tx-rate).
-      Gimbal slew-rate-limited tracking activates.
-      Discharge state machine ticks. On CENTERED: IDLE → ARMING (one
-      DO_REPEAT_RELAY), → FIRING after COMMAND_ACK.
-      When fire phase enters FIRING: → PHASE_FIRING.
-  PHASE_FIRING
-      Drone still freezing. Discharge timer counts --fire-period seconds.
-      When fire phase transitions FIRING → COOLDOWN: → PHASE_VERIFY.
-  PHASE_VERIFY
-      Drone frozen; gimbal continues to aim at target.
-      Captures --capture-frame-count frames at --capture-frame-interval spacing.
-      Picks best frame (highest detection confidence; Laplacian-variance fallback).
-      Saves <photo-output-dir>/Task_2_<team_name>_target_<#>_<ts>.jpg.
-      Prints prominent operator instruction to verify and upload before declaring.
-      → PHASE_HANDBACK.
-  PHASE_HANDBACK
-      Idempotent: send MAV_CMD_DO_SET_MODE → LOITER (or --handback-mode);
-      send_halt() for safety; defensive DO_SET_RELAY OFF.
-      On DO_SET_MODE ACK (or --handback-mode-timeout): → PHASE_DONE.
+Behavior
+--------
+- Drone is held at zero velocity (active hover; same primitive as gimbal_back_up).
+- Gimbal tracks the detected target offset by (aim_offset_x_norm,
+  aim_offset_y_norm) — the controller drives the target to that normalized
+  position in frame instead of frame center.
+- Keyboard input nudges the offset live and lets you fire test rounds.
+- No mission phases — just one open-ended calibration loop. Quit with 'q'.
 
-Bench (laptop dry-run, simulated LiDAR):
-  venv/bin/python test/tf_live_inferenceV2_final_auto.py \\
+Keyboard (single keys; arrow-key escape sequences NOT used)
+  h    decrease offset_x by --offset-nudge (default 0.005)  [camera right of target]
+  l    increase offset_x                                    [camera left of target]
+  j    increase offset_y (down)                             [camera above target]
+  k    decrease offset_y (up)                               [camera below target]
+  H/L/J/K  coarse nudge (5x the fine step)
+  f    fire ONE round (BLANK unless --live-fire; single DO_REPEAT_RELAY cycle)
+  s    save current offset to --aim-offset-file
+  r    reset offset to (0.0, 0.0)
+  c    re-center gimbal: wished -> (initial_pitch, initial_yaw)
+  p    print current offset + tracking summary
+  q    quit (does NOT auto-save; press 's' first if you want to persist)
+
+Sign convention (matches aim_offset.py):
+  positive aim_offset_x_norm  -> target appears RIGHT of center
+                                 -> camera aims LEFT of target
+                                 -> gun (right of camera) ends up ON target
+  positive aim_offset_y_norm  -> target appears BELOW center
+                                 -> camera aims ABOVE target
+
+Bench (laptop, no autopilot):
+  venv/bin/python test/tf_live_inferenceV2_gimbal_offset_calibrate.py \\
       export/project1_prod_saved_model/project1_prod_float16.tflite \\
-      -p --video 0 --no-mavlink --overlay \\
-      --team-name dev_test --target-number 1 --no-photo-capture
+      -p --video 0 --no-mavlink --overlay
 
-Pi BLANK-mode (autopilot connected, drone disarmed in GUIDED):
-  python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \\
-      --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \\
-      --start-from-current-gimbal --team-name dev_test --target-number 1
+Pi BLANK (autopilot connected, drone disarmed in GUIDED, no live fire):
+  python3 -B tf_live_inferenceV2_gimbal_offset_calibrate.py \\
+      ~/FullDataSetProdV3_depheavy_edgetpu.tflite \\
+      --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4
 
-Pi LIVE engagement (observer on RC, GUIDED + armed, drone >2 m from target):
-  python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \\
+Pi LIVE FIRE (drone hovering in GUIDED, observer on RC):
+  python3 -B tf_live_inferenceV2_gimbal_offset_calibrate.py \\
+      ~/FullDataSetProdV3_depheavy_edgetpu.tflite \\
       --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \\
-      --start-from-current-gimbal --live-fly --live-fire \\
-      --team-name <team_name> --target-number <N> \\
-      --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \\
-      --target-distance-cm 300 --distance-tolerance-cm 30
+      --live-fly --live-fire --no-guided-check
 
 Exit codes:
   0  OK
@@ -71,9 +63,7 @@ Exit codes:
   2  --process required for autonomous engagement
   3  --start-from-current-gimbal could not read MOUNT_STATUS in timeout
   4  GUIDED-mode check failed at startup
-  5  DISTANCE_SENSOR timeout at startup
   6  CLI flag conflict
-  7  Task 2 compliance failure (start distance < --min-start-distance-cm)
 """
 
 import argparse
@@ -90,7 +80,15 @@ import cv2
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aim_offset import add_aim_offset_args, resolve_aim_offset_from_args  # noqa: E402
+from aim_offset import (  # noqa: E402
+    add_aim_offset_args,
+    resolve_aim_offset_from_args,
+    save_aim_offset_file,
+    default_offset_path,
+)
+import datetime  # noqa: E402
+import os  # noqa: E402
+import select  # noqa: E402
 
 FPS = 10
 WIDTH = 1920
@@ -132,10 +130,11 @@ STATE_LOCKED = "LOCKED_HOLD"
 STATE_ALTITUDE_ADJUST = "ALTITUDE_ADJUST"
 STATE_FINAL_HOLD = "FINAL_HOLD"
 
-# Mission-phase names
-PHASE_DRONE_POSITIONING = "DRONE_POSITIONING"
-PHASE_HANDOFF_WAIT = "HANDOFF_WAIT"
-PHASE_GIMBAL_TRACKING = "GIMBAL_TRACKING"
+# Phase names for the calibrator. Only CALIBRATING + FIRING are used at
+# runtime; the others are retained so the OSD/log code paths that reference
+# them keep compiling (they never get hit).
+PHASE_CALIBRATING = "CALIBRATING"
+PHASE_CENTER_GIMBAL = "CENTER_GIMBAL"
 PHASE_FIRING = "FIRING"
 PHASE_VERIFY = "VERIFY"
 PHASE_HANDBACK = "HANDBACK"
@@ -189,6 +188,55 @@ pipeline4 = (
 # ============================================================================
 # Helpers (verbatim from both source scripts — identical bodies)
 # ============================================================================
+
+
+class RawTerminal:
+    """Non-blocking single-character keyboard reader. Lifted from
+    manual_gimbal_control.py — puts stdin in cbreak mode in __enter__,
+    restores on __exit__. read_key() returns a single char (or None) without
+    blocking. Designed for short ASCII keys (a-z, A-Z, 0-9) — NOT for arrow
+    escape sequences."""
+
+    def __init__(self) -> None:
+        self.fd = sys.stdin.fileno()
+        self.old = None
+        self.enabled = False
+
+    def __enter__(self):
+        try:
+            import termios
+            import tty
+        except ImportError:
+            return self
+        try:
+            self.old = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+            self.enabled = True
+        except Exception:
+            self.old = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.old is not None:
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+
+    def read_key(self):
+        if not self.enabled:
+            return None
+        rlist, _, _ = select.select([self.fd], [], [], 0)
+        if not rlist:
+            return None
+        try:
+            ch = os.read(self.fd, 1)
+        except (BlockingIOError, OSError):
+            return None
+        if not ch:
+            return None
+        try:
+            return ch.decode("utf-8", errors="replace")
+        except Exception:
+            return None
 
 
 def load_labels(label_path) -> list:
@@ -1282,10 +1330,6 @@ def main():
                              "Not used in this script — mission exits after one burst.")
 
     # --- Combined-mission flags ---
-    parser.add_argument("--handoff-confirm-frames", type=int, default=15,
-                        help="Consecutive FINAL_HOLD frames required to confirm "
-                             "drone-positioning -> gimbal-tracking handoff. "
-                             "Default 15 (~1.5s at 10 Hz).")
     parser.add_argument("--handback-mode", type=str, default="LOITER",
                         choices=["LOITER", "RTL", "ALT_HOLD", "LAND"],
                         help="Autopilot flight mode requested at end-of-mission via "
@@ -1294,11 +1338,6 @@ def main():
     parser.add_argument("--handback-mode-timeout", type=float, default=2.0,
                         help="Seconds to wait for DO_SET_MODE ACK before exiting "
                              "anyway. Default 2.0.")
-    parser.add_argument("--min-start-distance-cm", type=float, default=200.0,
-                        help="Task 2 compliance gate: first DISTANCE_SENSOR reading "
-                             "must be >= this value (Task 2 §5.2.4 requires the "
-                             "autonomous approach to start from >2 m). Default 200 cm. "
-                             "Set to 0 to disable the gate for laptop testing.")
 
     # --- Task 2 photo capture ---
     parser.add_argument("--team-name", type=str, default="unknown",
@@ -1320,6 +1359,15 @@ def main():
                              "(0.4 * 5 = 2.0 s total verify window).")
 
     add_aim_offset_args(parser)
+
+    parser.add_argument(
+        "--offset-nudge", type=float, default=0.005,
+        help="Normalized offset step per fine-nudge keypress (h/l/j/k). "
+             "Coarse keypresses (H/L/J/K) use 5x this. Default 0.005 "
+             "(~9 px on 1920x1080).")
+    parser.add_argument(
+        "--notes", type=str, default="",
+        help="Free-form notes string saved with the offset file on 's' key.")
 
     args = parser.parse_args()
     aim_offset_x_norm, aim_offset_y_norm = resolve_aim_offset_from_args(args)
@@ -1391,8 +1439,6 @@ def main():
         parser.error("--no-fire and --live-fire are mutually exclusive")
     if not (0 <= args.fire_relay <= 15):
         parser.error("--fire-relay must be in [0,15]")
-    if args.handoff_confirm_frames < 1:
-        parser.error("--handoff-confirm-frames must be >= 1")
     if args.handback_mode_timeout <= 0.0:
         parser.error("--handback-mode-timeout must be > 0")
     if args.capture_frame_count < 1:
@@ -1418,11 +1464,8 @@ def main():
         if v < 0.0:
             parser.error(f"{n} must be >= 0")
 
-    # Task 2 compliance warnings (don't reject — operator may know what they're doing)
-    if args.min_start_distance_cm < 200.0 and args.min_start_distance_cm > 0.0:
-        print(f"[WARN] --min-start-distance-cm={args.min_start_distance_cm:.0f} is "
-              f"below the Task 2 §5.2.4 minimum of 200 cm. Autonomous-extinguishing "
-              f"credit requires >2 m approach start.", flush=True)
+    # (Task 2 start-distance compliance warning removed — pilot positions
+    # manually in gimbal_back_up; no autonomous approach to gate.)
     if args.live_fire and args.team_name == "unknown" and not args.no_photo_capture:
         print("[WARN] --live-fire set but --team-name='unknown'. The Task 2 photo "
               "will be saved as 'Task_2_unknown_target_<N>_<ts>.jpg'. Set --team-name "
@@ -1501,42 +1544,9 @@ def main():
         print("[MAVLINK] Disabled via --no-mavlink. Pure dry-run with simulated LiDAR.",
               flush=True)
 
-    # --- Wait for first DISTANCE_SENSOR (real mode only) ---
-    if not args.simulate_distance:
-        want_orient = args.rangefinder_orientation
-        orient_desc = ("any orientation" if want_orient == -1
-                       else f"orientation={want_orient}")
-        print(f"[INIT] Waiting up to {args.distance_sensor_timeout:.1f}s for first "
-              f"DISTANCE_SENSOR ({orient_desc})...", flush=True)
-        end_t = time.monotonic() + args.distance_sensor_timeout
-        got = False
-        seen_orientations = set()
-        while time.monotonic() < end_t:
-            try:
-                msg = master.recv_match(blocking=True, timeout=0.3)
-            except Exception:
-                msg = None
-            if msg is not None and msg.get_type() == "DISTANCE_SENSOR":
-                msg_orient = int(getattr(msg, "orientation", 0))
-                seen_orientations.add(msg_orient)
-                if want_orient != -1 and msg_orient != want_orient:
-                    continue
-                cm = float(getattr(msg, "current_distance", 0))
-                print(f"[INIT] DISTANCE_SENSOR seen: {cm:.1f} cm "
-                      f"(orientation={msg_orient})", flush=True)
-                got = True
-                break
-        if not got:
-            seen_str = (", ".join(str(o) for o in sorted(seen_orientations))
-                        if seen_orientations else "none")
-            print(f"[ERROR] No DISTANCE_SENSOR with {orient_desc} within "
-                  f"{args.distance_sensor_timeout:.1f}s. Seen: {seen_str}.",
-                  flush=True)
-            try:
-                master.close()
-            except Exception:
-                pass
-            sys.exit(EXIT_DISTANCE_SENSOR_TIMEOUT)
+    # (DISTANCE_SENSOR startup wait removed — gimbal_back_up doesn't need range
+    # telemetry since the drone is static; if a DISTANCE_SENSOR is present its
+    # readings still get captured by MovementLink.handle_message for OSD/log.)
 
     # --- Gimbal initial pose ---
     initial_pitch = clamp(args.initial_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
@@ -1604,10 +1614,14 @@ def main():
     print(f"[MISSION] drone tx={'LIVE-FLY' if args.live_fly else 'BLANK'}  "
           f"discharge={'LIVE' if args.live_fire else ('DISABLED' if args.no_fire else 'BLANK')}",
           flush=True)
-    print(f"[MISSION] photo_capture={'OFF' if args.no_photo_capture else 'ON'}  "
-          f"min_start_distance_cm={args.min_start_distance_cm:.0f}", flush=True)
-    print("[MISSION] Phase ordering: DRONE_POSITIONING -> HANDOFF_WAIT "
-          "-> GIMBAL_TRACKING -> FIRING -> VERIFY -> HANDBACK -> DONE", flush=True)
+    print(f"[MISSION] photo_capture={'OFF' if args.no_photo_capture else 'ON'}",
+          flush=True)
+    print("[MISSION] Phase ordering: CENTER_GIMBAL -> FIRING -> VERIFY -> "
+          "HANDBACK -> DONE", flush=True)
+    print(f"[MISSION] center_duration={args.center_duration:.1f}s  "
+          f"fire_period={args.fire_period:.1f}s  "
+          f"handback={args.handback_mode}  "
+          f"team={args.team_name} target=#{args.target_number}", flush=True)
     print("[INFO] Axis assumptions:", flush=True)
     print("  image: +x=right, +y=down, center=(frame_w/2, frame_h/2)", flush=True)
     print("  drone yaw: target right -> +yaw_rate (clockwise)", flush=True)
@@ -1657,8 +1671,7 @@ def main():
         # Fire-side
         "fire_phase": "IDLE", "fire_elapsed": 0.0,
         # Mission
-        "mission_phase": PHASE_DRONE_POSITIONING,
-        "final_hold_streak": 0,
+        "mission_phase": PHASE_CALIBRATING,
         "verify_frames_captured": 0,
         "verify_photo_path": None,
     }
@@ -1674,10 +1687,13 @@ def main():
 
     # Mission state — owner: inference thread. Other threads read-only under mission_lock.
     mission_state = {
-        "phase": PHASE_DRONE_POSITIONING,
+        "phase": PHASE_CALIBRATING,
         "phase_entered_at": time.monotonic(),
-        "final_hold_streak": 0,
-        "handoff_at": None,
+        # Calibrator-only mutable state
+        "aim_offset_x_norm": float(aim_offset_x_norm),
+        "aim_offset_y_norm": float(aim_offset_y_norm),
+        "fire_requested": False,
+        "quit_requested": False,
         "fire_started_at": None,
         "verify_started_at": None,
         "verify_frames_captured": 0,
@@ -1687,7 +1703,6 @@ def main():
         "handback_started_at": None,
         "handback_mode_ack": None,    # (result, mono_time)
         "handback_done": False,
-        "first_lidar_checked": False,
     }
     run_start_mono = time.monotonic()
 
@@ -2049,26 +2064,8 @@ def main():
             fx = frame_w / 2.0
             fy = frame_h / 2.0
 
-            # Task 2 compliance gate (PHASE_DRONE_POSITIONING only, first valid reading)
-            if (phase == PHASE_DRONE_POSITIONING
-                    and not mission_state["first_lidar_checked"]
-                    and lidar_source == "sensor"
-                    and lidar_cm is not None
-                    and args.min_start_distance_cm > 0.0):
-                if lidar_cm < args.min_start_distance_cm:
-                    print(f"\n[COMPLIANCE FAIL] First DISTANCE_SENSOR reading "
-                          f"{lidar_cm:.1f}cm < --min-start-distance-cm="
-                          f"{args.min_start_distance_cm:.0f}cm.\n"
-                          f"Task 2 §5.2.4 requires the autonomous approach to "
-                          f"start from >2 m. Re-position the drone farther from "
-                          f"the target and retry.\n", flush=True)
-                    stop_event.set()
-                    sys.exit(EXIT_COMPLIANCE_FAIL)
-                print(f"[COMPLIANCE OK] start distance {lidar_cm:.1f}cm "
-                      f">= {args.min_start_distance_cm:.0f}cm "
-                      f"(Task 2 >2m criterion satisfied)", flush=True)
-                with mission_lock:
-                    mission_state["first_lidar_checked"] = True
+            # (Task 2 compliance gate removed — drone is static in this fallback;
+            # operator hand-positions >2 m back before launching the script.)
 
             # Reset per-frame outputs (drone)
             state = STATE_NO_TARGET
@@ -2097,7 +2094,7 @@ def main():
             alt_error_norm = 0.0
             control_cy = float(fy)
 
-            # Bounds + targets
+            # Bounds + targets (diagnostic only — drone never moves in gimbal_back_up)
             low_bound = args.target_distance_cm - args.distance_tolerance_cm
             high_bound = args.target_distance_cm + args.distance_tolerance_cm
             center_low = args.target_distance_cm - args.distance_center_band_cm
@@ -2106,279 +2103,25 @@ def main():
             target_y_px = args.altitude_target_y_ratio * float(frame_h)
 
             # ----------------------------------------------------------------
-            # Branch A: drone is positioning (state machine active)
+            # Branch A: PHASE_CALIBRATING — drone frozen, gimbal tracks target
+            #           with offset, keyboard nudges offset and triggers fire.
             # ----------------------------------------------------------------
-            if phase in (PHASE_DRONE_POSITIONING, PHASE_HANDOFF_WAIT):
-                if selected is None:
-                    no_target_streak += 1
-                    dropout_grace = no_target_streak < max(1, args.no_target_dropout_frames)
-                    if locked_on_target:
-                        state = STATE_LOCKED
-                        move_label = "LOCKED_NO_TARGET"
-                        displacement_label = "LOCKED_NO_TARGET"
-                        altitude_confirm_count = 0
-                        if abs(dist_error_cm) > args.distance_center_band_cm:
-                            vx = distance_vx_command(
-                                lidar_cm, args.target_distance_cm,
-                                args.lock_forward_gain, args.max_vx,
-                                args.min_distance_correct_vx,
-                            )
-                            move_label = "LOCKED_DIST_CORRECT"
-                    else:
-                        state = STATE_NO_TARGET
-                        if not dropout_grace:
-                            hold_confirm_count = 0
-                            altitude_confirm_count = 0
-                            final_hold_engaged = False
-                            sim_target_cy = None
-                            ema_cx = None
-                            ema_cy = None
-                            if yaw_aligned_latched:
-                                print(f"[YAW HYST] released (NO_TARGET streak "
-                                      f"{no_target_streak} >= "
-                                      f"{args.no_target_dropout_frames})", flush=True)
-                            yaw_aligned_latched = False
-                            out_of_align_streak = 0
-                        # else: brief flicker — keep counters / EMA / latch.
-                else:
-                    no_target_streak = 0
-                    (x1, y1), (x2, y2) = selected["bbox"]
-                    raw_cx = (x1 + x2) / 2.0
-                    raw_cy = (y1 + y2) / 2.0
-                    # EMA smoothing on bbox center to kill 1-frame wobble.
-                    if ema_cx is None or ema_cy is None:
-                        ema_cx = raw_cx
-                        ema_cy = raw_cy
-                    else:
-                        a = clamp(args.bbox_ema_alpha, 0.0, 1.0)
-                        ema_cx = a * raw_cx + (1.0 - a) * ema_cx
-                        ema_cy = a * raw_cy + (1.0 - a) * ema_cy
-                    cx = ema_cx
-                    cy = ema_cy
-                    if (not locked_on_target) or (sim_target_cy is None):
-                        sim_target_cy = float(cy)
-
-                    control_cy = float(cy)
-                    if locked_on_target and sim_target_cy is not None:
-                        control_cy = float(sim_target_cy)
-
-                    tcx = int(round(cx))
-                    tcy = int(round(control_cy))
-                    err_x = (cx - float(fx)) / max(1.0, float(fx))
-                    err_y = (control_cy - float(fy)) / max(1.0, float(fy))
-                    yaw_to_center_deg = err_x * (args.camera_hfov_deg * 0.5)
-                    disp_dx_px = cx - float(fx)
-                    disp_dy_px = control_cy - float(fy)
-                    disp_mag_px = math.hypot(disp_dx_px, disp_dy_px)
-                    yaw_vec_dx_px = disp_dx_px
-                    yaw_vec_mag_px = abs(yaw_vec_dx_px)
-                    yaw_rad = math.radians(yaw_to_center_deg)
-                    body_vec_fwd = math.cos(yaw_rad)
-                    body_vec_right = math.sin(yaw_rad)
-                    target_confidence = float(selected.get("confidence", 0.0))
-                    alt_error_px = target_y_px - control_cy
-                    alt_error_norm = alt_error_px / max(1.0, float(fy))
-                    alt_vec_dy_px = alt_error_px
-                    alt_vec_mag_px = abs(alt_vec_dy_px)
-
-                    displacement_label = direction_label(err_x, err_y, args.drone_deadband)
-                    yaw_label = yaw_direction_label(err_x, args.drone_deadband)
-                    # Hysteresis latch — see drone_auto for full rationale.
-                    entry_db = args.drone_deadband
-                    exit_db = args.drone_deadband * max(1.0, args.yaw_hysteresis_ratio)
-                    _prev_latch = yaw_aligned_latched
-                    if yaw_aligned_latched:
-                        if abs(err_x) > exit_db:
-                            out_of_align_streak += 1
-                            if out_of_align_streak >= max(1, args.yaw_align_dropout_frames):
-                                yaw_aligned_latched = False
-                                out_of_align_streak = 0
-                        else:
-                            out_of_align_streak = 0
-                    else:
-                        if abs(err_x) <= entry_db:
-                            yaw_aligned_latched = True
-                            out_of_align_streak = 0
-                    if _prev_latch != yaw_aligned_latched:
-                        print(f"[YAW HYST] "
-                              f"{'LATCHED' if yaw_aligned_latched else 'RELEASED'} "
-                              f"err_x={err_x:+.3f} entry_db={entry_db:.3f} "
-                              f"exit_db={exit_db:.3f}", flush=True)
-                    yaw_aligned = yaw_aligned_latched
-                    in_distance_window = low_bound <= lidar_cm <= high_bound
-
-                    if locked_on_target:
-                        state = STATE_LOCKED
-                        lock_deadband = args.drone_deadband * args.lock_deadband_scale
-                        move_label = "LOCKED_STEADY"
-                        if abs(err_x) > lock_deadband:
-                            yaw_rate = clamp(args.lock_yaw_gain * err_x,
-                                             -args.max_yaw_rate, args.max_yaw_rate)
-                            move_label = "LOCKED_YAW_CORRECT"
-                        if abs(dist_error_cm) > args.distance_center_band_cm:
-                            vx = distance_vx_command(
-                                lidar_cm, args.target_distance_cm,
-                                args.lock_forward_gain, args.max_vx,
-                                args.min_distance_correct_vx,
-                            )
-                            if move_label == "LOCKED_STEADY":
-                                move_label = "LOCKED_DIST_CORRECT"
-                            else:
-                                move_label = "LOCKED_YAW+DIST_CORRECT"
-
-                        if not final_hold_engaged:
-                            state = STATE_ALTITUDE_ADJUST
-                            if abs(alt_error_norm) > args.altitude_deadband:
-                                altitude_confirm_count = 0
-                                vz = clamp(-args.altitude_gain * alt_error_norm,
-                                           -args.max_vz, args.max_vz)
-                                if move_label == "LOCKED_STEADY":
-                                    move_label = "ALT_ADJUST_ONLY"
-                                else:
-                                    move_label = f"{move_label}+ALT_ADJUST"
-                            else:
-                                altitude_confirm_count += 1
-                                move_label = "ALT_CONFIRM"
-                                if altitude_confirm_count >= args.altitude_lock_confirm_frames:
-                                    final_hold_engaged = True
-                                    state = STATE_FINAL_HOLD
-                                    move_label = "FINAL_HOLD"
-                        else:
-                            state = STATE_FINAL_HOLD
-                            if abs(alt_error_norm) > args.altitude_deadband:
-                                vz = clamp(-args.altitude_gain * alt_error_norm,
-                                           -args.max_vz, args.max_vz)
-                                if move_label == "LOCKED_STEADY":
-                                    move_label = "FINAL_HOLD_ALT_CORRECT"
-                                else:
-                                    move_label = f"{move_label}+ALT_HOLD_CORRECT"
-                    else:
-                        final_hold_engaged = False
-                        altitude_confirm_count = 0
-                        if not yaw_aligned:
-                            hold_confirm_count = 0
-                            state = STATE_CENTERING
-                            yaw_rate = clamp(args.drone_yaw_gain * err_x,
-                                             -args.max_yaw_rate, args.max_yaw_rate)
-                            move_label = yaw_label
-                        else:
-                            if lidar_cm > high_bound:
-                                hold_confirm_count = 0
-                                state = STATE_APPROACH
-                                vx = distance_vx_command(
-                                    lidar_cm, args.target_distance_cm,
-                                    args.forward_gain, args.max_vx,
-                                    args.min_distance_correct_vx,
-                                )
-                                move_label = "FORWARD"
-                            elif lidar_cm < low_bound:
-                                hold_confirm_count = 0
-                                state = STATE_APPROACH
-                                vx = distance_vx_command(
-                                    lidar_cm, args.target_distance_cm,
-                                    args.forward_gain, args.max_vx,
-                                    args.min_distance_correct_vx,
-                                )
-                                move_label = "BACKWARD"
-                            else:
-                                state = STATE_HOLD
-                                move_label = "HOLD"
-                                hold_confirm_count += 1
-                                if abs(dist_error_cm) > args.distance_center_band_cm:
-                                    vx = distance_vx_command(
-                                        lidar_cm, args.target_distance_cm,
-                                        args.hold_forward_gain, args.max_vx,
-                                        args.hold_min_distance_correct_vx,
-                                    )
-                                    if vx > 0.0:
-                                        move_label = "HOLD_TRIM_FORWARD"
-                                    elif vx < 0.0:
-                                        move_label = "HOLD_TRIM_BACKWARD"
-
-                        if (args.lock_after_approach
-                                and yaw_aligned
-                                and in_distance_window
-                                and hold_confirm_count >= args.lock_confirm_frames):
-                            locked_on_target = True
-                            lock_frame_idx = frame_idx
-                            state = STATE_LOCKED
-                            move_label = "LOCKED_STEADY"
-                            altitude_confirm_count = 0
-                            final_hold_engaged = False
-                            print(f"[LOCK ENGAGED] hold_frames={hold_confirm_count} "
-                                  f"lidar={lidar_cm:.1f}cm err_x={err_x:+.3f}",
-                                  flush=True)
-
-                # Publish velocity for the drone tx loop
-                drone_link.set_velocity(vx, 0.0, vz, yaw_rate)
-
-                # Gimbal is STATIC during drone positioning — do NOT update wished_*.
-                # The gimbal tx loop will heartbeat the startup setpoint.
-
-                # Simulated LiDAR / altitude dynamics
-                if args.simulate_distance:
-                    disturbance_vx = args.sim_drift_vx_mps
-                    if args.sim_drift_jitter_mps > 0.0:
-                        disturbance_vx += random.uniform(
-                            -args.sim_drift_jitter_mps, args.sim_drift_jitter_mps)
-                    net_vx = vx + disturbance_vx
-                    sim_state["lidar_cm"] += (
-                        -net_vx * dt * 100.0 * args.sim_lidar_approach_factor)
-                    if args.sim_lidar_noise_cm > 0.0:
-                        sim_state["lidar_cm"] += random.uniform(
-                            -args.sim_lidar_noise_cm, args.sim_lidar_noise_cm)
-                    sim_state["lidar_cm"] = clamp(
-                        sim_state["lidar_cm"], args.sim_lidar_min_cm,
-                        args.sim_lidar_max_cm)
-                    disturbance_vz = args.sim_altitude_drift_vz_mps
-                    if args.sim_altitude_drift_jitter_vz_mps > 0.0:
-                        disturbance_vz += random.uniform(
-                            -args.sim_altitude_drift_jitter_vz_mps,
-                            args.sim_altitude_drift_jitter_vz_mps)
-                    if sim_target_cy is not None:
-                        net_vz = vz + disturbance_vz
-                        sim_target_cy += -net_vz * dt * args.sim_altitude_response_px_per_m
-                        if args.sim_altitude_noise_px > 0.0:
-                            sim_target_cy += random.uniform(
-                                -args.sim_altitude_noise_px, args.sim_altitude_noise_px)
-                        sim_target_cy = clamp(sim_target_cy, 0.0, float(frame_h - 1))
-
-                # --- Mission phase transitions for drone phases ---
-                if phase == PHASE_DRONE_POSITIONING and state == STATE_FINAL_HOLD:
-                    with mission_lock:
-                        mission_state["final_hold_streak"] = 1
-                    _transition_phase(PHASE_HANDOFF_WAIT, "drone reached FINAL_HOLD")
-                elif phase == PHASE_HANDOFF_WAIT:
-                    if state == STATE_FINAL_HOLD:
-                        with mission_lock:
-                            mission_state["final_hold_streak"] += 1
-                            streak = mission_state["final_hold_streak"]
-                        if streak >= args.handoff_confirm_frames:
-                            _transition_phase(
-                                PHASE_GIMBAL_TRACKING,
-                                f"FINAL_HOLD stable for {args.handoff_confirm_frames} frames")
-                            with mission_lock:
-                                mission_state["handoff_at"] = time.monotonic()
-                    else:
-                        with mission_lock:
-                            prev_streak = mission_state["final_hold_streak"]
-                            mission_state["final_hold_streak"] = 0
-                        if prev_streak > 0:
-                            print(f"[HANDOFF RESET] state regressed to {state}; "
-                                  f"streak {prev_streak} -> 0", flush=True)
-
-            # ----------------------------------------------------------------
-            # Branch B: gimbal tracking / firing (drone freezes)
-            # ----------------------------------------------------------------
-            elif phase in (PHASE_GIMBAL_TRACKING, PHASE_FIRING):
-                # FREEZE the drone — continuous zero-velocity setpoints
+            if phase == PHASE_CALIBRATING:
+                # Freeze drone
                 drone_link.set_velocity(0.0, 0.0, 0.0, 0.0)
                 state = STATE_FINAL_HOLD  # for OSD continuity
-                move_label = "FROZEN"
-                lidar_source = lidar_source  # passthrough
+                move_label = "CALIBRATING"
 
-                # Gimbal tracking — applies aim offset so the gun lands on target
-                # even though the camera is offset from the gun barrel.
+                # Read current offset under lock (keyboard thread may have mutated)
+                with mission_lock:
+                    aim_offset_x_norm = mission_state["aim_offset_x_norm"]
+                    aim_offset_y_norm = mission_state["aim_offset_y_norm"]
+                    fire_req = mission_state["fire_requested"]
+                    if fire_req:
+                        mission_state["fire_requested"] = False
+                    quit_req = mission_state["quit_requested"]
+
+                # Gimbal tracks target+offset; if no target, holds last wished
                 if selected is not None:
                     (x1, y1), (x2, y2) = selected["bbox"]
                     cx = (x1 + x2) / 2.0
@@ -2396,46 +2139,98 @@ def main():
 
                     cur_pitch, cur_yaw = gimbal_link.get_current()
                     if move_label_gimbal != "CENTERED":
-                        wished_yaw = clamp(cur_yaw + args.gimbal_yaw_gain * adj_err_x,
-                                           GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
-                        wished_pitch = clamp(cur_pitch - args.pitch_gain * adj_err_y,
-                                             GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+                        wished_yaw = clamp(
+                            cur_yaw + args.gimbal_yaw_gain * adj_err_x,
+                            GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+                        wished_pitch = clamp(
+                            cur_pitch - args.pitch_gain * adj_err_y,
+                            GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
                         gimbal_link.set_wished(wished_pitch, wished_yaw)
-                    centered = (move_label_gimbal == "CENTERED")
                 else:
-                    centered = False
+                    displacement_label = "CALIBRATING_NO_TARGET"
 
-                # Advance the discharge state machine
-                prev_fire_phase_local = fire_state["phase"]
-                fire_advance(centered=centered)
-                new_fire_phase_local = fire_state["phase"]
+                # Quit on user request
+                if quit_req:
+                    print("[CALIBRATE] quit requested via 'q' key — exiting",
+                          flush=True)
+                    stop_event.set()
+                    break
 
-                # Mission transitions out of GIMBAL_TRACKING / FIRING
-                if phase == PHASE_GIMBAL_TRACKING and new_fire_phase_local == "FIRING":
+                # Fire on user request: hop into PHASE_FIRING, then loop back
+                if fire_req:
+                    print(f"[CALIBRATE] fire requested — entering PHASE_FIRING "
+                          f"(offset=({aim_offset_x_norm:+.4f}, "
+                          f"{aim_offset_y_norm:+.4f}))", flush=True)
                     with mission_lock:
                         mission_state["fire_started_at"] = time.monotonic()
-                    _transition_phase(PHASE_FIRING,
-                                      "discharge state machine entered FIRING")
-                elif (phase == PHASE_FIRING
-                      and prev_fire_phase_local == "FIRING"
-                      and new_fire_phase_local == "COOLDOWN"):
-                    # Burst complete — go to PHASE_VERIFY (or skip to HANDBACK)
-                    if args.no_photo_capture:
-                        _transition_phase(
-                            PHASE_HANDBACK,
-                            f"discharge complete ({args.fire_period:.1f}s); "
-                            f"--no-photo-capture")
-                        do_handback_once()
-                    else:
-                        with mission_lock:
-                            mission_state["verify_started_at"] = time.monotonic()
-                            mission_state["verify_frames_captured"] = 0
-                            mission_state["verify_best_frame"] = None
-                            mission_state["verify_done"] = False
-                        _transition_phase(
-                            PHASE_VERIFY,
-                            f"discharge complete ({args.fire_period:.1f}s); "
-                            f"capturing photos")
+                    _transition_phase(
+                        PHASE_FIRING, "user pressed 'f' (one-shot manual fire)")
+
+            # ----------------------------------------------------------------
+            # Branch B: PHASE_FIRING — drone frozen, best-effort gimbal track,
+            #          blind discharge timer (no detection gate)
+            # ----------------------------------------------------------------
+            elif phase == PHASE_FIRING:
+                # Freeze drone
+                drone_link.set_velocity(0.0, 0.0, 0.0, 0.0)
+                state = STATE_FINAL_HOLD
+                move_label = "FIRING"
+
+                # Best-effort gimbal tracking: if a target is detected, slew
+                # toward it; otherwise keep the last wished setpoint (center).
+                if selected is not None:
+                    (x1, y1), (x2, y2) = selected["bbox"]
+                    cx = (x1 + x2) / 2.0
+                    cy = (y1 + y2) / 2.0
+                    err_x = (cx - fx) / max(1.0, fx)
+                    err_y = (cy - fy) / max(1.0, fy)
+                    # Apply aim offset so the gun lands on the target.
+                    adj_err_x = err_x - aim_offset_x_norm
+                    adj_err_y = err_y - aim_offset_y_norm
+                    target_confidence = float(selected.get("confidence", 0.0))
+                    tcx = int(round(cx))
+                    tcy = int(round(cy))
+                    move_label_gimbal = direction_label(
+                        adj_err_x, adj_err_y, args.gimbal_deadband)
+                    displacement_label = move_label_gimbal
+
+                    cur_pitch, cur_yaw = gimbal_link.get_current()
+                    if move_label_gimbal != "CENTERED":
+                        wished_yaw = clamp(
+                            cur_yaw + args.gimbal_yaw_gain * adj_err_x,
+                            GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+                        wished_pitch = clamp(
+                            cur_pitch - args.pitch_gain * adj_err_y,
+                            GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+                        gimbal_link.set_wished(wished_pitch, wished_yaw)
+                else:
+                    displacement_label = "FIRING_BLIND"
+
+                # Tick discharge SM unconditionally (blind fire — no detection gate)
+                prev_fire_phase_local = fire_state["phase"]
+                fire_advance(centered=True)
+                new_fire_phase_local = fire_state["phase"]
+
+                # Latch fire_started_at on IDLE -> ARMING / FIRING transition
+                if (prev_fire_phase_local == "IDLE"
+                        and new_fire_phase_local in ("ARMING", "FIRING")):
+                    with mission_lock:
+                        if mission_state["fire_started_at"] is None:
+                            mission_state["fire_started_at"] = time.monotonic()
+
+                # Calibrator: when discharge cycle completes, return to
+                # CALIBRATING so the user can adjust offset and fire again.
+                # We also reset the discharge SM to IDLE so the next 'f' rearms.
+                if (prev_fire_phase_local == "FIRING"
+                        and new_fire_phase_local == "COOLDOWN"):
+                    fire_state["phase"] = "IDLE"
+                    fire_state["fire_send_time"] = 0.0
+                    with mission_lock:
+                        mission_state["fire_started_at"] = None
+                    _transition_phase(
+                        PHASE_CALIBRATING,
+                        f"discharge cycle complete ({args.fire_period:.1f}s); "
+                        f"back to calibration")
 
             # ----------------------------------------------------------------
             # Branch C: PHASE_VERIFY — capture photos
@@ -2570,7 +2365,6 @@ def main():
                 overlay_state["fire_elapsed"] = fire_elapsed
                 overlay_state["mission_phase"] = phase
                 with mission_lock:
-                    overlay_state["final_hold_streak"] = mission_state["final_hold_streak"]
                     overlay_state["verify_frames_captured"] = mission_state["verify_frames_captured"]
                     overlay_state["verify_photo_path"] = mission_state["verify_photo_path"]
 
@@ -2626,25 +2420,130 @@ def main():
     t_cap = threading.Thread(target=capture_thread, daemon=True)
     t_inf = threading.Thread(target=inference_thread, daemon=True)
 
+    # --- Keyboard polling thread (calibrator-specific) ---
+    fine_step = float(args.offset_nudge)
+    coarse_step = fine_step * 5.0
+    OFFSET_CLAMP = 0.5  # safety clamp; offsets outside ±0.5 are nonsensical
+
+    def _save_offset_now():
+        with mission_lock:
+            x = mission_state["aim_offset_x_norm"]
+            y = mission_state["aim_offset_y_norm"]
+        path = Path(args.aim_offset_file) if args.aim_offset_file else default_offset_path()
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            save_aim_offset_file(
+                path, x, y, notes=args.notes, calibrated_at=ts)
+            print(f"[CALIBRATE] SAVED offset ({x:+.4f}, {y:+.4f}) -> {path}",
+                  flush=True)
+        except Exception as e:
+            print(f"[CALIBRATE] save FAILED: {e}", flush=True)
+
+    def keyboard_thread():
+        if not sys.stdin.isatty():
+            print("[CALIBRATE] stdin is not a TTY — keyboard control disabled. "
+                  "Use --aim-offset-x-norm / --aim-offset-y-norm CLI overrides "
+                  "or edit the file directly.", flush=True)
+            return
+        with RawTerminal() as term:
+            if not term.enabled:
+                print("[CALIBRATE] could not enable cbreak mode — keyboard "
+                      "control disabled.", flush=True)
+                return
+            print("[CALIBRATE] keyboard ready. h/l=offset_x, j/k=offset_y "
+                  "(uppercase=coarse), f=fire, s=save, r=reset, c=re-center, "
+                  "p=print, q=quit.", flush=True)
+            while not stop_event.is_set():
+                ch = term.read_key()
+                if ch is None:
+                    time.sleep(0.05)
+                    continue
+                act = None
+                dx, dy = 0.0, 0.0
+                if ch == "h":
+                    dx, dy = -fine_step, 0.0; act = "nudge-x-"
+                elif ch == "l":
+                    dx, dy = +fine_step, 0.0; act = "nudge-x+"
+                elif ch == "j":
+                    dx, dy = 0.0, +fine_step; act = "nudge-y+ (down)"
+                elif ch == "k":
+                    dx, dy = 0.0, -fine_step; act = "nudge-y- (up)"
+                elif ch == "H":
+                    dx, dy = -coarse_step, 0.0; act = "COARSE-x-"
+                elif ch == "L":
+                    dx, dy = +coarse_step, 0.0; act = "COARSE-x+"
+                elif ch == "J":
+                    dx, dy = 0.0, +coarse_step; act = "COARSE-y+ (down)"
+                elif ch == "K":
+                    dx, dy = 0.0, -coarse_step; act = "COARSE-y- (up)"
+                elif ch == "f":
+                    with mission_lock:
+                        mission_state["fire_requested"] = True
+                    print("[CALIBRATE] fire requested (will trigger on next "
+                          "inference frame)", flush=True)
+                    continue
+                elif ch == "s":
+                    _save_offset_now()
+                    continue
+                elif ch == "r":
+                    with mission_lock:
+                        mission_state["aim_offset_x_norm"] = 0.0
+                        mission_state["aim_offset_y_norm"] = 0.0
+                    print("[CALIBRATE] offset RESET to (0.0000, 0.0000)",
+                          flush=True)
+                    continue
+                elif ch == "c":
+                    gimbal_link.set_wished(args.initial_pitch, args.initial_yaw)
+                    print(f"[CALIBRATE] gimbal re-center: wished -> "
+                          f"({args.initial_pitch:+.1f}, "
+                          f"{args.initial_yaw:+.1f})", flush=True)
+                    continue
+                elif ch == "p":
+                    with mission_lock:
+                        x = mission_state["aim_offset_x_norm"]
+                        y = mission_state["aim_offset_y_norm"]
+                    cp, cy_ = gimbal_link.get_current()
+                    print(f"[CALIBRATE] offset=({x:+.4f}, {y:+.4f})  "
+                          f"gimbal=(pitch={cp:+.2f}, yaw={cy_:+.2f})  "
+                          f"fire_phase={fire_state['phase']}", flush=True)
+                    continue
+                elif ch in ("q", "Q", "\x03"):
+                    with mission_lock:
+                        mission_state["quit_requested"] = True
+                    print("[CALIBRATE] quit requested", flush=True)
+                    return
+                else:
+                    continue
+                with mission_lock:
+                    new_x = clamp(mission_state["aim_offset_x_norm"] + dx,
+                                  -OFFSET_CLAMP, OFFSET_CLAMP)
+                    new_y = clamp(mission_state["aim_offset_y_norm"] + dy,
+                                  -OFFSET_CLAMP, OFFSET_CLAMP)
+                    mission_state["aim_offset_x_norm"] = new_x
+                    mission_state["aim_offset_y_norm"] = new_y
+                print(f"[CALIBRATE] {act}: offset -> "
+                      f"({new_x:+.4f}, {new_y:+.4f})", flush=True)
+
+    t_keys = threading.Thread(target=keyboard_thread, daemon=True)
+
     if master is not None:
         t_shared_rx.start()
     t_drone_tx.start()
     t_gimbal_tx.start()
     t_cap.start()
     t_inf.start()
+    t_keys.start()
 
     frame_interval = 1.0 / FPS
 
     # --- Mission OSD color palette ---
     def _phase_color(phase: str):
         return {
-            PHASE_DRONE_POSITIONING: (255, 200, 0),   # cyan-ish
-            PHASE_HANDOFF_WAIT:      (0, 255, 255),   # yellow
-            PHASE_GIMBAL_TRACKING:   (255, 0, 255),   # magenta
-            PHASE_FIRING:            (0, 0, 255),     # red
-            PHASE_VERIFY:            (255, 255, 255), # white
-            PHASE_HANDBACK:          (0, 255, 0),     # green
-            PHASE_DONE:              (0, 255, 0),
+            PHASE_CENTER_GIMBAL: (255, 200, 0),   # cyan-ish
+            PHASE_FIRING:        (0, 0, 255),     # red
+            PHASE_VERIFY:        (255, 255, 255), # white
+            PHASE_HANDBACK:      (0, 255, 0),     # green
+            PHASE_DONE:          (0, 255, 0),
         }.get(phase, (200, 200, 200))
 
     # --- Main thread: video writer loop with full OSD overlay ---
@@ -2715,7 +2614,7 @@ def main():
                         cv2.circle(frame, (tcx, alt_target_y), 5, (255, 170, 0), -1)
 
                     # --- Mission banner (top center) ---
-                    mp = o.get("mission_phase", PHASE_DRONE_POSITIONING)
+                    mp = o.get("mission_phase", PHASE_CENTER_GIMBAL)
                     elapsed_s = time.monotonic() - run_start_mono
                     banner = (f"MISSION: {mp} | TARGET: {args.team_name}/"
                               f"#{args.target_number} | t={elapsed_s:.1f}s")
@@ -2748,10 +2647,8 @@ def main():
                     cv2.putText(
                         frame,
                         f"lock={o['lock_status']} "
-                        f"hold={o['hold_confirm_count']}/{args.lock_confirm_frames} "
-                        f"alt={o['altitude_confirm_count']}/{args.altitude_lock_confirm_frames} "
                         f"final={o['final_hold_status']} "
-                        f"final_streak={o['final_hold_streak']}/{args.handoff_confirm_frames}",
+                        f"[drone-frozen in gimbal_back_up]",
                         (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.50, lock_color,
                         2, cv2.LINE_AA)
 

@@ -36,6 +36,9 @@ import argparse
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# Make the test/ dir importable so we can pull in the shared aim_offset helper
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aim_offset import add_aim_offset_args, resolve_aim_offset_from_args  # noqa: E402
 
 FPS = 10
 WIDTH = 1920
@@ -728,7 +731,10 @@ def main():
                              "(2*fire_period) completes, before the next burst can be triggered. "
                              "Default 0.5. Total time between fires = 2*fire_period + fire_cooldown.")
 
+    add_aim_offset_args(parser)
+
     args = parser.parse_args()
+    aim_offset_x_norm, aim_offset_y_norm = resolve_aim_offset_from_args(args)
 
     if args.process and not args.model:
         parser.error("--process requires a model argument")
@@ -1122,7 +1128,12 @@ def main():
                 cy = (y1 + y2) / 2.0
                 err_x = (cx - fx) / max(1.0, fx)
                 err_y = (cy - fy) / max(1.0, fy)
-                move_label = direction_label(err_x, err_y, args.deadband)
+                # Aim offset — gimbal drives target toward (aim_x, aim_y) instead
+                # of (0, 0). Both the CENTERED check and the tracking law use the
+                # adjusted error so the gun (offset from camera) ends up on target.
+                adj_err_x = err_x - aim_offset_x_norm
+                adj_err_y = err_y - aim_offset_y_norm
+                move_label = direction_label(adj_err_x, adj_err_y, args.deadband)
 
                 # Read where the gimbal actually IS (the TX-thread-ramped commanded position).
                 # Recompute wished from that — NOT from a free-running integrator. The wished
@@ -1131,9 +1142,9 @@ def main():
                 cur_pitch, cur_yaw = link.get_current()
 
                 if move_label != "CENTERED":
-                    wished_yaw = clamp(cur_yaw + args.yaw_gain * err_x,
+                    wished_yaw = clamp(cur_yaw + args.yaw_gain * adj_err_x,
                                         GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
-                    wished_pitch = clamp(cur_pitch - args.pitch_gain * err_y,
+                    wished_pitch = clamp(cur_pitch - args.pitch_gain * adj_err_y,
                                           GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
                     link.set_wished(wished_pitch, wished_yaw)
                 else:

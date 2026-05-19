@@ -1,69 +1,70 @@
 """
-tf_live_inferenceV2_final_auto.py
+tf_live_inferenceV2_gimbal_back_up.py
 
-Big City RPAS Task 2 (Fire Extinguishing) — combined autonomous engagement.
-Sequential one-shot mission: drone positions, gimbal aims, water discharges,
-photo is captured, autopilot is switched to LOITER, pilot resumes control.
-
-Architecture (single MAVLink master shared by both Link classes):
-  Threads
-    1. capture_thread       : RTSP -> latest_frame (drop-old, single slot)
-    2. inference_thread     : detection + phase-conditional state machines
-                              (owns mission_phase transitions)
-    3. drone_tx_thread      : SET_POSITION_TARGET_LOCAL_NED at --tx-rate Hz
-    4. gimbal_tx_thread     : slew-rate-limited DO_MOUNT_CONTROL at --send-rate Hz
-    5. shared_rx_thread     : ONE recv_match loop; dispatches by msg type to
-                              drone_link.handle_message / gimbal_link.handle_message
-    + main thread           : OSD overlay + optional video writer
+Big City RPAS Task 2 fallback — pilot manually positions the drone "far back"
+(3-5 m) from the target, engages GUIDED + hovers, then runs this script.
+The drone never moves or rotates; gimbal centers, then fires the water relay
+for --fire-period seconds, then captures the Task 2 photo and hands control
+back to LOITER. Use this if final_auto.py fails in the field.
 
 Mission flow
-  PHASE_DRONE_POSITIONING
-      drone-auto 7-state machine runs; gimbal held STATIC at startup angle.
-      First-frame compliance check: first valid DISTANCE_SENSOR reading must be
-      >= --min-start-distance-cm (Task 2 §5.2.4 requires >2 m approach start).
-      When drone state == STATE_FINAL_HOLD: → PHASE_HANDOFF_WAIT.
-  PHASE_HANDOFF_WAIT
-      Count consecutive FINAL_HOLD frames. Reset to 0 if state regresses.
-      When count >= --handoff-confirm-frames: → PHASE_GIMBAL_TRACKING.
-  PHASE_GIMBAL_TRACKING
-      Drone enters FREEZE (continuous zero-velocity setpoints at --tx-rate).
-      Gimbal slew-rate-limited tracking activates.
-      Discharge state machine ticks. On CENTERED: IDLE → ARMING (one
-      DO_REPEAT_RELAY), → FIRING after COMMAND_ACK.
-      When fire phase enters FIRING: → PHASE_FIRING.
+  PHASE_CENTER_GIMBAL
+      Drone frozen at zero velocity. Gimbal commanded to
+      (--initial-pitch, --initial-yaw), default (0, 0).
+      Exits after --center-duration seconds. → PHASE_FIRING.
   PHASE_FIRING
-      Drone still freezing. Discharge timer counts --fire-period seconds.
-      When fire phase transitions FIRING → COOLDOWN: → PHASE_VERIFY.
+      Drone still frozen. Best-effort gimbal tracking: if a target is detected,
+      gimbal slews toward it; if not, gimbal holds at center.
+      Discharge state machine ticks unconditionally (fire is BLIND, no
+      detection gate). On COMMAND_ACK for cmd 182: → FIRING. After
+      --fire-period seconds ON, the autopilot completes the relay cycle.
+      → PHASE_VERIFY.
   PHASE_VERIFY
-      Drone frozen; gimbal continues to aim at target.
+      Drone frozen; gimbal frozen at last setpoint.
       Captures --capture-frame-count frames at --capture-frame-interval spacing.
-      Picks best frame (highest detection confidence; Laplacian-variance fallback).
-      Saves <photo-output-dir>/Task_2_<team_name>_target_<#>_<ts>.jpg.
-      Prints prominent operator instruction to verify and upload before declaring.
+      Picks best frame (highest detection confidence; Laplacian-variance
+      fallback if no detection). Saves
+      <photo-output-dir>/Task_2_<team_name>_target_<#>_<ts>.jpg.
       → PHASE_HANDBACK.
   PHASE_HANDBACK
       Idempotent: send MAV_CMD_DO_SET_MODE → LOITER (or --handback-mode);
       send_halt() for safety; defensive DO_SET_RELAY OFF.
       On DO_SET_MODE ACK (or --handback-mode-timeout): → PHASE_DONE.
 
-Bench (laptop dry-run, simulated LiDAR):
-  venv/bin/python test/tf_live_inferenceV2_final_auto.py \\
+Architecture (single MAVLink master shared by both Link classes — same as
+final_auto.py):
+  Threads
+    1. capture_thread       : RTSP -> latest_frame
+    2. inference_thread     : detection + 5-phase mission state machine
+                              (owns mission_phase transitions; always
+                              publishes zero velocity to drone_link)
+    3. drone_tx_thread      : SET_POSITION_TARGET_LOCAL_NED(0,0,0,0)
+                              at --tx-rate Hz (keeps ArduPilot from timing
+                              out the GUIDED setpoint)
+    4. gimbal_tx_thread     : slew-rate-limited DO_MOUNT_CONTROL at --send-rate Hz
+    5. shared_rx_thread     : ONE recv_match loop; dispatches by msg type
+    + main thread           : OSD overlay + optional video writer
+
+Total wall-time: ~12 s (2 center + 5 fire + 2 verify + 2 handback + slack).
+
+Bench (laptop dry-run, no autopilot, skip photo):
+  venv/bin/python test/tf_live_inferenceV2_gimbal_back_up.py \\
       export/project1_prod_saved_model/project1_prod_float16.tflite \\
       -p --video 0 --no-mavlink --overlay \\
       --team-name dev_test --target-number 1 --no-photo-capture
 
-Pi BLANK-mode (autopilot connected, drone disarmed in GUIDED):
-  python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \\
+Pi BLANK-mode (autopilot connected, drone disarmed in GUIDED, no fire):
+  python3 -B tf_live_inferenceV2_gimbal_back_up.py \\
+      ~/FullDataSetProdV3_depheavy_edgetpu.tflite \\
       --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \\
-      --start-from-current-gimbal --team-name dev_test --target-number 1
+      --team-name dev_test --target-number 1
 
-Pi LIVE engagement (observer on RC, GUIDED + armed, drone >2 m from target):
-  python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProd_edgetpu.tflite \\
+Pi LIVE (autopilot connected, drone armed in GUIDED, observer on RC):
+  python3 -B tf_live_inferenceV2_gimbal_back_up.py \\
+      ~/FullDataSetProdV3_depheavy_edgetpu.tflite \\
       --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \\
-      --start-from-current-gimbal --live-fly --live-fire \\
-      --team-name <team_name> --target-number <N> \\
-      --max-vx 0.20 --max-vz 0.15 --max-yaw-rate 10.0 \\
-      --target-distance-cm 300 --distance-tolerance-cm 30
+      --live-fly --live-fire --no-guided-check \\
+      --team-name <YOUR_TEAM> --target-number 1
 
 Exit codes:
   0  OK
@@ -71,9 +72,7 @@ Exit codes:
   2  --process required for autonomous engagement
   3  --start-from-current-gimbal could not read MOUNT_STATUS in timeout
   4  GUIDED-mode check failed at startup
-  5  DISTANCE_SENSOR timeout at startup
   6  CLI flag conflict
-  7  Task 2 compliance failure (start distance < --min-start-distance-cm)
 """
 
 import argparse
@@ -132,10 +131,8 @@ STATE_LOCKED = "LOCKED_HOLD"
 STATE_ALTITUDE_ADJUST = "ALTITUDE_ADJUST"
 STATE_FINAL_HOLD = "FINAL_HOLD"
 
-# Mission-phase names
-PHASE_DRONE_POSITIONING = "DRONE_POSITIONING"
-PHASE_HANDOFF_WAIT = "HANDOFF_WAIT"
-PHASE_GIMBAL_TRACKING = "GIMBAL_TRACKING"
+# Mission-phase names (5-phase mission for gimbal_back_up; drone is always frozen)
+PHASE_CENTER_GIMBAL = "CENTER_GIMBAL"
 PHASE_FIRING = "FIRING"
 PHASE_VERIFY = "VERIFY"
 PHASE_HANDBACK = "HANDBACK"
@@ -1282,10 +1279,6 @@ def main():
                              "Not used in this script — mission exits after one burst.")
 
     # --- Combined-mission flags ---
-    parser.add_argument("--handoff-confirm-frames", type=int, default=15,
-                        help="Consecutive FINAL_HOLD frames required to confirm "
-                             "drone-positioning -> gimbal-tracking handoff. "
-                             "Default 15 (~1.5s at 10 Hz).")
     parser.add_argument("--handback-mode", type=str, default="LOITER",
                         choices=["LOITER", "RTL", "ALT_HOLD", "LAND"],
                         help="Autopilot flight mode requested at end-of-mission via "
@@ -1294,11 +1287,6 @@ def main():
     parser.add_argument("--handback-mode-timeout", type=float, default=2.0,
                         help="Seconds to wait for DO_SET_MODE ACK before exiting "
                              "anyway. Default 2.0.")
-    parser.add_argument("--min-start-distance-cm", type=float, default=200.0,
-                        help="Task 2 compliance gate: first DISTANCE_SENSOR reading "
-                             "must be >= this value (Task 2 §5.2.4 requires the "
-                             "autonomous approach to start from >2 m). Default 200 cm. "
-                             "Set to 0 to disable the gate for laptop testing.")
 
     # --- Task 2 photo capture ---
     parser.add_argument("--team-name", type=str, default="unknown",
@@ -1391,8 +1379,6 @@ def main():
         parser.error("--no-fire and --live-fire are mutually exclusive")
     if not (0 <= args.fire_relay <= 15):
         parser.error("--fire-relay must be in [0,15]")
-    if args.handoff_confirm_frames < 1:
-        parser.error("--handoff-confirm-frames must be >= 1")
     if args.handback_mode_timeout <= 0.0:
         parser.error("--handback-mode-timeout must be > 0")
     if args.capture_frame_count < 1:
@@ -1418,11 +1404,8 @@ def main():
         if v < 0.0:
             parser.error(f"{n} must be >= 0")
 
-    # Task 2 compliance warnings (don't reject — operator may know what they're doing)
-    if args.min_start_distance_cm < 200.0 and args.min_start_distance_cm > 0.0:
-        print(f"[WARN] --min-start-distance-cm={args.min_start_distance_cm:.0f} is "
-              f"below the Task 2 §5.2.4 minimum of 200 cm. Autonomous-extinguishing "
-              f"credit requires >2 m approach start.", flush=True)
+    # (Task 2 start-distance compliance warning removed — pilot positions
+    # manually in gimbal_back_up; no autonomous approach to gate.)
     if args.live_fire and args.team_name == "unknown" and not args.no_photo_capture:
         print("[WARN] --live-fire set but --team-name='unknown'. The Task 2 photo "
               "will be saved as 'Task_2_unknown_target_<N>_<ts>.jpg'. Set --team-name "
@@ -1501,42 +1484,9 @@ def main():
         print("[MAVLINK] Disabled via --no-mavlink. Pure dry-run with simulated LiDAR.",
               flush=True)
 
-    # --- Wait for first DISTANCE_SENSOR (real mode only) ---
-    if not args.simulate_distance:
-        want_orient = args.rangefinder_orientation
-        orient_desc = ("any orientation" if want_orient == -1
-                       else f"orientation={want_orient}")
-        print(f"[INIT] Waiting up to {args.distance_sensor_timeout:.1f}s for first "
-              f"DISTANCE_SENSOR ({orient_desc})...", flush=True)
-        end_t = time.monotonic() + args.distance_sensor_timeout
-        got = False
-        seen_orientations = set()
-        while time.monotonic() < end_t:
-            try:
-                msg = master.recv_match(blocking=True, timeout=0.3)
-            except Exception:
-                msg = None
-            if msg is not None and msg.get_type() == "DISTANCE_SENSOR":
-                msg_orient = int(getattr(msg, "orientation", 0))
-                seen_orientations.add(msg_orient)
-                if want_orient != -1 and msg_orient != want_orient:
-                    continue
-                cm = float(getattr(msg, "current_distance", 0))
-                print(f"[INIT] DISTANCE_SENSOR seen: {cm:.1f} cm "
-                      f"(orientation={msg_orient})", flush=True)
-                got = True
-                break
-        if not got:
-            seen_str = (", ".join(str(o) for o in sorted(seen_orientations))
-                        if seen_orientations else "none")
-            print(f"[ERROR] No DISTANCE_SENSOR with {orient_desc} within "
-                  f"{args.distance_sensor_timeout:.1f}s. Seen: {seen_str}.",
-                  flush=True)
-            try:
-                master.close()
-            except Exception:
-                pass
-            sys.exit(EXIT_DISTANCE_SENSOR_TIMEOUT)
+    # (DISTANCE_SENSOR startup wait removed — gimbal_back_up doesn't need range
+    # telemetry since the drone is static; if a DISTANCE_SENSOR is present its
+    # readings still get captured by MovementLink.handle_message for OSD/log.)
 
     # --- Gimbal initial pose ---
     initial_pitch = clamp(args.initial_pitch, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
@@ -1604,10 +1554,14 @@ def main():
     print(f"[MISSION] drone tx={'LIVE-FLY' if args.live_fly else 'BLANK'}  "
           f"discharge={'LIVE' if args.live_fire else ('DISABLED' if args.no_fire else 'BLANK')}",
           flush=True)
-    print(f"[MISSION] photo_capture={'OFF' if args.no_photo_capture else 'ON'}  "
-          f"min_start_distance_cm={args.min_start_distance_cm:.0f}", flush=True)
-    print("[MISSION] Phase ordering: DRONE_POSITIONING -> HANDOFF_WAIT "
-          "-> GIMBAL_TRACKING -> FIRING -> VERIFY -> HANDBACK -> DONE", flush=True)
+    print(f"[MISSION] photo_capture={'OFF' if args.no_photo_capture else 'ON'}",
+          flush=True)
+    print("[MISSION] Phase ordering: CENTER_GIMBAL -> FIRING -> VERIFY -> "
+          "HANDBACK -> DONE", flush=True)
+    print(f"[MISSION] center_duration={args.center_duration:.1f}s  "
+          f"fire_period={args.fire_period:.1f}s  "
+          f"handback={args.handback_mode}  "
+          f"team={args.team_name} target=#{args.target_number}", flush=True)
     print("[INFO] Axis assumptions:", flush=True)
     print("  image: +x=right, +y=down, center=(frame_w/2, frame_h/2)", flush=True)
     print("  drone yaw: target right -> +yaw_rate (clockwise)", flush=True)
@@ -1657,8 +1611,7 @@ def main():
         # Fire-side
         "fire_phase": "IDLE", "fire_elapsed": 0.0,
         # Mission
-        "mission_phase": PHASE_DRONE_POSITIONING,
-        "final_hold_streak": 0,
+        "mission_phase": PHASE_CENTER_GIMBAL,
         "verify_frames_captured": 0,
         "verify_photo_path": None,
     }
@@ -1674,10 +1627,8 @@ def main():
 
     # Mission state — owner: inference thread. Other threads read-only under mission_lock.
     mission_state = {
-        "phase": PHASE_DRONE_POSITIONING,
+        "phase": PHASE_CENTER_GIMBAL,
         "phase_entered_at": time.monotonic(),
-        "final_hold_streak": 0,
-        "handoff_at": None,
         "fire_started_at": None,
         "verify_started_at": None,
         "verify_frames_captured": 0,
@@ -1687,7 +1638,6 @@ def main():
         "handback_started_at": None,
         "handback_mode_ack": None,    # (result, mono_time)
         "handback_done": False,
-        "first_lidar_checked": False,
     }
     run_start_mono = time.monotonic()
 
@@ -2049,26 +1999,8 @@ def main():
             fx = frame_w / 2.0
             fy = frame_h / 2.0
 
-            # Task 2 compliance gate (PHASE_DRONE_POSITIONING only, first valid reading)
-            if (phase == PHASE_DRONE_POSITIONING
-                    and not mission_state["first_lidar_checked"]
-                    and lidar_source == "sensor"
-                    and lidar_cm is not None
-                    and args.min_start_distance_cm > 0.0):
-                if lidar_cm < args.min_start_distance_cm:
-                    print(f"\n[COMPLIANCE FAIL] First DISTANCE_SENSOR reading "
-                          f"{lidar_cm:.1f}cm < --min-start-distance-cm="
-                          f"{args.min_start_distance_cm:.0f}cm.\n"
-                          f"Task 2 §5.2.4 requires the autonomous approach to "
-                          f"start from >2 m. Re-position the drone farther from "
-                          f"the target and retry.\n", flush=True)
-                    stop_event.set()
-                    sys.exit(EXIT_COMPLIANCE_FAIL)
-                print(f"[COMPLIANCE OK] start distance {lidar_cm:.1f}cm "
-                      f">= {args.min_start_distance_cm:.0f}cm "
-                      f"(Task 2 >2m criterion satisfied)", flush=True)
-                with mission_lock:
-                    mission_state["first_lidar_checked"] = True
+            # (Task 2 compliance gate removed — drone is static in this fallback;
+            # operator hand-positions >2 m back before launching the script.)
 
             # Reset per-frame outputs (drone)
             state = STATE_NO_TARGET
@@ -2097,7 +2029,7 @@ def main():
             alt_error_norm = 0.0
             control_cy = float(fy)
 
-            # Bounds + targets
+            # Bounds + targets (diagnostic only — drone never moves in gimbal_back_up)
             low_bound = args.target_distance_cm - args.distance_tolerance_cm
             high_bound = args.target_distance_cm + args.distance_tolerance_cm
             center_low = args.target_distance_cm - args.distance_center_band_cm
@@ -2106,285 +2038,54 @@ def main():
             target_y_px = args.altitude_target_y_ratio * float(frame_h)
 
             # ----------------------------------------------------------------
-            # Branch A: drone is positioning (state machine active)
+            # Branch A: PHASE_CENTER_GIMBAL — drone frozen, gimbal to (initial)
             # ----------------------------------------------------------------
-            if phase in (PHASE_DRONE_POSITIONING, PHASE_HANDOFF_WAIT):
-                if selected is None:
-                    no_target_streak += 1
-                    dropout_grace = no_target_streak < max(1, args.no_target_dropout_frames)
-                    if locked_on_target:
-                        state = STATE_LOCKED
-                        move_label = "LOCKED_NO_TARGET"
-                        displacement_label = "LOCKED_NO_TARGET"
-                        altitude_confirm_count = 0
-                        if abs(dist_error_cm) > args.distance_center_band_cm:
-                            vx = distance_vx_command(
-                                lidar_cm, args.target_distance_cm,
-                                args.lock_forward_gain, args.max_vx,
-                                args.min_distance_correct_vx,
-                            )
-                            move_label = "LOCKED_DIST_CORRECT"
-                    else:
-                        state = STATE_NO_TARGET
-                        if not dropout_grace:
-                            hold_confirm_count = 0
-                            altitude_confirm_count = 0
-                            final_hold_engaged = False
-                            sim_target_cy = None
-                            ema_cx = None
-                            ema_cy = None
-                            if yaw_aligned_latched:
-                                print(f"[YAW HYST] released (NO_TARGET streak "
-                                      f"{no_target_streak} >= "
-                                      f"{args.no_target_dropout_frames})", flush=True)
-                            yaw_aligned_latched = False
-                            out_of_align_streak = 0
-                        # else: brief flicker — keep counters / EMA / latch.
-                else:
-                    no_target_streak = 0
-                    (x1, y1), (x2, y2) = selected["bbox"]
-                    raw_cx = (x1 + x2) / 2.0
-                    raw_cy = (y1 + y2) / 2.0
-                    # EMA smoothing on bbox center to kill 1-frame wobble.
-                    if ema_cx is None or ema_cy is None:
-                        ema_cx = raw_cx
-                        ema_cy = raw_cy
-                    else:
-                        a = clamp(args.bbox_ema_alpha, 0.0, 1.0)
-                        ema_cx = a * raw_cx + (1.0 - a) * ema_cx
-                        ema_cy = a * raw_cy + (1.0 - a) * ema_cy
-                    cx = ema_cx
-                    cy = ema_cy
-                    if (not locked_on_target) or (sim_target_cy is None):
-                        sim_target_cy = float(cy)
-
-                    control_cy = float(cy)
-                    if locked_on_target and sim_target_cy is not None:
-                        control_cy = float(sim_target_cy)
-
-                    tcx = int(round(cx))
-                    tcy = int(round(control_cy))
-                    err_x = (cx - float(fx)) / max(1.0, float(fx))
-                    err_y = (control_cy - float(fy)) / max(1.0, float(fy))
-                    yaw_to_center_deg = err_x * (args.camera_hfov_deg * 0.5)
-                    disp_dx_px = cx - float(fx)
-                    disp_dy_px = control_cy - float(fy)
-                    disp_mag_px = math.hypot(disp_dx_px, disp_dy_px)
-                    yaw_vec_dx_px = disp_dx_px
-                    yaw_vec_mag_px = abs(yaw_vec_dx_px)
-                    yaw_rad = math.radians(yaw_to_center_deg)
-                    body_vec_fwd = math.cos(yaw_rad)
-                    body_vec_right = math.sin(yaw_rad)
-                    target_confidence = float(selected.get("confidence", 0.0))
-                    alt_error_px = target_y_px - control_cy
-                    alt_error_norm = alt_error_px / max(1.0, float(fy))
-                    alt_vec_dy_px = alt_error_px
-                    alt_vec_mag_px = abs(alt_vec_dy_px)
-
-                    displacement_label = direction_label(err_x, err_y, args.drone_deadband)
-                    yaw_label = yaw_direction_label(err_x, args.drone_deadband)
-                    # Hysteresis latch — see drone_auto for full rationale.
-                    entry_db = args.drone_deadband
-                    exit_db = args.drone_deadband * max(1.0, args.yaw_hysteresis_ratio)
-                    _prev_latch = yaw_aligned_latched
-                    if yaw_aligned_latched:
-                        if abs(err_x) > exit_db:
-                            out_of_align_streak += 1
-                            if out_of_align_streak >= max(1, args.yaw_align_dropout_frames):
-                                yaw_aligned_latched = False
-                                out_of_align_streak = 0
-                        else:
-                            out_of_align_streak = 0
-                    else:
-                        if abs(err_x) <= entry_db:
-                            yaw_aligned_latched = True
-                            out_of_align_streak = 0
-                    if _prev_latch != yaw_aligned_latched:
-                        print(f"[YAW HYST] "
-                              f"{'LATCHED' if yaw_aligned_latched else 'RELEASED'} "
-                              f"err_x={err_x:+.3f} entry_db={entry_db:.3f} "
-                              f"exit_db={exit_db:.3f}", flush=True)
-                    yaw_aligned = yaw_aligned_latched
-                    in_distance_window = low_bound <= lidar_cm <= high_bound
-
-                    if locked_on_target:
-                        state = STATE_LOCKED
-                        lock_deadband = args.drone_deadband * args.lock_deadband_scale
-                        move_label = "LOCKED_STEADY"
-                        if abs(err_x) > lock_deadband:
-                            yaw_rate = clamp(args.lock_yaw_gain * err_x,
-                                             -args.max_yaw_rate, args.max_yaw_rate)
-                            move_label = "LOCKED_YAW_CORRECT"
-                        if abs(dist_error_cm) > args.distance_center_band_cm:
-                            vx = distance_vx_command(
-                                lidar_cm, args.target_distance_cm,
-                                args.lock_forward_gain, args.max_vx,
-                                args.min_distance_correct_vx,
-                            )
-                            if move_label == "LOCKED_STEADY":
-                                move_label = "LOCKED_DIST_CORRECT"
-                            else:
-                                move_label = "LOCKED_YAW+DIST_CORRECT"
-
-                        if not final_hold_engaged:
-                            state = STATE_ALTITUDE_ADJUST
-                            if abs(alt_error_norm) > args.altitude_deadband:
-                                altitude_confirm_count = 0
-                                vz = clamp(-args.altitude_gain * alt_error_norm,
-                                           -args.max_vz, args.max_vz)
-                                if move_label == "LOCKED_STEADY":
-                                    move_label = "ALT_ADJUST_ONLY"
-                                else:
-                                    move_label = f"{move_label}+ALT_ADJUST"
-                            else:
-                                altitude_confirm_count += 1
-                                move_label = "ALT_CONFIRM"
-                                if altitude_confirm_count >= args.altitude_lock_confirm_frames:
-                                    final_hold_engaged = True
-                                    state = STATE_FINAL_HOLD
-                                    move_label = "FINAL_HOLD"
-                        else:
-                            state = STATE_FINAL_HOLD
-                            if abs(alt_error_norm) > args.altitude_deadband:
-                                vz = clamp(-args.altitude_gain * alt_error_norm,
-                                           -args.max_vz, args.max_vz)
-                                if move_label == "LOCKED_STEADY":
-                                    move_label = "FINAL_HOLD_ALT_CORRECT"
-                                else:
-                                    move_label = f"{move_label}+ALT_HOLD_CORRECT"
-                    else:
-                        final_hold_engaged = False
-                        altitude_confirm_count = 0
-                        if not yaw_aligned:
-                            hold_confirm_count = 0
-                            state = STATE_CENTERING
-                            yaw_rate = clamp(args.drone_yaw_gain * err_x,
-                                             -args.max_yaw_rate, args.max_yaw_rate)
-                            move_label = yaw_label
-                        else:
-                            if lidar_cm > high_bound:
-                                hold_confirm_count = 0
-                                state = STATE_APPROACH
-                                vx = distance_vx_command(
-                                    lidar_cm, args.target_distance_cm,
-                                    args.forward_gain, args.max_vx,
-                                    args.min_distance_correct_vx,
-                                )
-                                move_label = "FORWARD"
-                            elif lidar_cm < low_bound:
-                                hold_confirm_count = 0
-                                state = STATE_APPROACH
-                                vx = distance_vx_command(
-                                    lidar_cm, args.target_distance_cm,
-                                    args.forward_gain, args.max_vx,
-                                    args.min_distance_correct_vx,
-                                )
-                                move_label = "BACKWARD"
-                            else:
-                                state = STATE_HOLD
-                                move_label = "HOLD"
-                                hold_confirm_count += 1
-                                if abs(dist_error_cm) > args.distance_center_band_cm:
-                                    vx = distance_vx_command(
-                                        lidar_cm, args.target_distance_cm,
-                                        args.hold_forward_gain, args.max_vx,
-                                        args.hold_min_distance_correct_vx,
-                                    )
-                                    if vx > 0.0:
-                                        move_label = "HOLD_TRIM_FORWARD"
-                                    elif vx < 0.0:
-                                        move_label = "HOLD_TRIM_BACKWARD"
-
-                        if (args.lock_after_approach
-                                and yaw_aligned
-                                and in_distance_window
-                                and hold_confirm_count >= args.lock_confirm_frames):
-                            locked_on_target = True
-                            lock_frame_idx = frame_idx
-                            state = STATE_LOCKED
-                            move_label = "LOCKED_STEADY"
-                            altitude_confirm_count = 0
-                            final_hold_engaged = False
-                            print(f"[LOCK ENGAGED] hold_frames={hold_confirm_count} "
-                                  f"lidar={lidar_cm:.1f}cm err_x={err_x:+.3f}",
-                                  flush=True)
-
-                # Publish velocity for the drone tx loop
-                drone_link.set_velocity(vx, 0.0, vz, yaw_rate)
-
-                # Gimbal is STATIC during drone positioning — do NOT update wished_*.
-                # The gimbal tx loop will heartbeat the startup setpoint.
-
-                # Simulated LiDAR / altitude dynamics
-                if args.simulate_distance:
-                    disturbance_vx = args.sim_drift_vx_mps
-                    if args.sim_drift_jitter_mps > 0.0:
-                        disturbance_vx += random.uniform(
-                            -args.sim_drift_jitter_mps, args.sim_drift_jitter_mps)
-                    net_vx = vx + disturbance_vx
-                    sim_state["lidar_cm"] += (
-                        -net_vx * dt * 100.0 * args.sim_lidar_approach_factor)
-                    if args.sim_lidar_noise_cm > 0.0:
-                        sim_state["lidar_cm"] += random.uniform(
-                            -args.sim_lidar_noise_cm, args.sim_lidar_noise_cm)
-                    sim_state["lidar_cm"] = clamp(
-                        sim_state["lidar_cm"], args.sim_lidar_min_cm,
-                        args.sim_lidar_max_cm)
-                    disturbance_vz = args.sim_altitude_drift_vz_mps
-                    if args.sim_altitude_drift_jitter_vz_mps > 0.0:
-                        disturbance_vz += random.uniform(
-                            -args.sim_altitude_drift_jitter_vz_mps,
-                            args.sim_altitude_drift_jitter_vz_mps)
-                    if sim_target_cy is not None:
-                        net_vz = vz + disturbance_vz
-                        sim_target_cy += -net_vz * dt * args.sim_altitude_response_px_per_m
-                        if args.sim_altitude_noise_px > 0.0:
-                            sim_target_cy += random.uniform(
-                                -args.sim_altitude_noise_px, args.sim_altitude_noise_px)
-                        sim_target_cy = clamp(sim_target_cy, 0.0, float(frame_h - 1))
-
-                # --- Mission phase transitions for drone phases ---
-                if phase == PHASE_DRONE_POSITIONING and state == STATE_FINAL_HOLD:
-                    with mission_lock:
-                        mission_state["final_hold_streak"] = 1
-                    _transition_phase(PHASE_HANDOFF_WAIT, "drone reached FINAL_HOLD")
-                elif phase == PHASE_HANDOFF_WAIT:
-                    if state == STATE_FINAL_HOLD:
-                        with mission_lock:
-                            mission_state["final_hold_streak"] += 1
-                            streak = mission_state["final_hold_streak"]
-                        if streak >= args.handoff_confirm_frames:
-                            _transition_phase(
-                                PHASE_GIMBAL_TRACKING,
-                                f"FINAL_HOLD stable for {args.handoff_confirm_frames} frames")
-                            with mission_lock:
-                                mission_state["handoff_at"] = time.monotonic()
-                    else:
-                        with mission_lock:
-                            prev_streak = mission_state["final_hold_streak"]
-                            mission_state["final_hold_streak"] = 0
-                        if prev_streak > 0:
-                            print(f"[HANDOFF RESET] state regressed to {state}; "
-                                  f"streak {prev_streak} -> 0", flush=True)
-
-            # ----------------------------------------------------------------
-            # Branch B: gimbal tracking / firing (drone freezes)
-            # ----------------------------------------------------------------
-            elif phase in (PHASE_GIMBAL_TRACKING, PHASE_FIRING):
-                # FREEZE the drone — continuous zero-velocity setpoints
+            if phase == PHASE_CENTER_GIMBAL:
+                # Freeze drone
                 drone_link.set_velocity(0.0, 0.0, 0.0, 0.0)
                 state = STATE_FINAL_HOLD  # for OSD continuity
-                move_label = "FROZEN"
-                lidar_source = lidar_source  # passthrough
+                move_label = "CENTER_GIMBAL"
+                displacement_label = "CENTER_GIMBAL"
 
-                # Gimbal tracking — applies aim offset so the gun lands on target
-                # even though the camera is offset from the gun barrel.
+                # Drive gimbal toward (initial_pitch, initial_yaw)
+                gimbal_link.set_wished(args.initial_pitch, args.initial_yaw)
+
+                # Surface detection in OSD/log even though we don't use it for control
+                if selected is not None:
+                    (x1, y1), (x2, y2) = selected["bbox"]
+                    target_confidence = float(selected.get("confidence", 0.0))
+                    tcx = int(round((x1 + x2) / 2.0))
+                    tcy = int(round((y1 + y2) / 2.0))
+                    err_x = (tcx - fx) / max(1.0, fx)
+                    err_y = (tcy - fy) / max(1.0, fy)
+
+                # Timer-based transition to PHASE_FIRING
+                with mission_lock:
+                    phase_entered_at = mission_state["phase_entered_at"]
+                if (time.monotonic() - phase_entered_at) >= args.center_duration:
+                    _transition_phase(
+                        PHASE_FIRING,
+                        f"center duration {args.center_duration:.1f}s elapsed")
+
+            # ----------------------------------------------------------------
+            # Branch B: PHASE_FIRING — drone frozen, best-effort gimbal track,
+            #          blind discharge timer (no detection gate)
+            # ----------------------------------------------------------------
+            elif phase == PHASE_FIRING:
+                # Freeze drone
+                drone_link.set_velocity(0.0, 0.0, 0.0, 0.0)
+                state = STATE_FINAL_HOLD
+                move_label = "FIRING"
+
+                # Best-effort gimbal tracking: if a target is detected, slew
+                # toward it; otherwise keep the last wished setpoint (center).
                 if selected is not None:
                     (x1, y1), (x2, y2) = selected["bbox"]
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
                     err_x = (cx - fx) / max(1.0, fx)
                     err_y = (cy - fy) / max(1.0, fy)
+                    # Apply aim offset so the gun lands on the target.
                     adj_err_x = err_x - aim_offset_x_norm
                     adj_err_y = err_y - aim_offset_y_norm
                     target_confidence = float(selected.get("confidence", 0.0))
@@ -2396,30 +2097,31 @@ def main():
 
                     cur_pitch, cur_yaw = gimbal_link.get_current()
                     if move_label_gimbal != "CENTERED":
-                        wished_yaw = clamp(cur_yaw + args.gimbal_yaw_gain * adj_err_x,
-                                           GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
-                        wished_pitch = clamp(cur_pitch - args.pitch_gain * adj_err_y,
-                                             GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
+                        wished_yaw = clamp(
+                            cur_yaw + args.gimbal_yaw_gain * adj_err_x,
+                            GIMBAL_YAW_MIN_DEG, GIMBAL_YAW_MAX_DEG)
+                        wished_pitch = clamp(
+                            cur_pitch - args.pitch_gain * adj_err_y,
+                            GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG)
                         gimbal_link.set_wished(wished_pitch, wished_yaw)
-                    centered = (move_label_gimbal == "CENTERED")
                 else:
-                    centered = False
+                    displacement_label = "FIRING_BLIND"
 
-                # Advance the discharge state machine
+                # Tick discharge SM unconditionally (blind fire — no detection gate)
                 prev_fire_phase_local = fire_state["phase"]
-                fire_advance(centered=centered)
+                fire_advance(centered=True)
                 new_fire_phase_local = fire_state["phase"]
 
-                # Mission transitions out of GIMBAL_TRACKING / FIRING
-                if phase == PHASE_GIMBAL_TRACKING and new_fire_phase_local == "FIRING":
+                # Latch fire_started_at on IDLE -> ARMING / FIRING transition
+                if (prev_fire_phase_local == "IDLE"
+                        and new_fire_phase_local in ("ARMING", "FIRING")):
                     with mission_lock:
-                        mission_state["fire_started_at"] = time.monotonic()
-                    _transition_phase(PHASE_FIRING,
-                                      "discharge state machine entered FIRING")
-                elif (phase == PHASE_FIRING
-                      and prev_fire_phase_local == "FIRING"
-                      and new_fire_phase_local == "COOLDOWN"):
-                    # Burst complete — go to PHASE_VERIFY (or skip to HANDBACK)
+                        if mission_state["fire_started_at"] is None:
+                            mission_state["fire_started_at"] = time.monotonic()
+
+                # Transition out when discharge SM enters COOLDOWN
+                if (prev_fire_phase_local == "FIRING"
+                        and new_fire_phase_local == "COOLDOWN"):
                     if args.no_photo_capture:
                         _transition_phase(
                             PHASE_HANDBACK,
@@ -2570,7 +2272,6 @@ def main():
                 overlay_state["fire_elapsed"] = fire_elapsed
                 overlay_state["mission_phase"] = phase
                 with mission_lock:
-                    overlay_state["final_hold_streak"] = mission_state["final_hold_streak"]
                     overlay_state["verify_frames_captured"] = mission_state["verify_frames_captured"]
                     overlay_state["verify_photo_path"] = mission_state["verify_photo_path"]
 
@@ -2638,13 +2339,11 @@ def main():
     # --- Mission OSD color palette ---
     def _phase_color(phase: str):
         return {
-            PHASE_DRONE_POSITIONING: (255, 200, 0),   # cyan-ish
-            PHASE_HANDOFF_WAIT:      (0, 255, 255),   # yellow
-            PHASE_GIMBAL_TRACKING:   (255, 0, 255),   # magenta
-            PHASE_FIRING:            (0, 0, 255),     # red
-            PHASE_VERIFY:            (255, 255, 255), # white
-            PHASE_HANDBACK:          (0, 255, 0),     # green
-            PHASE_DONE:              (0, 255, 0),
+            PHASE_CENTER_GIMBAL: (255, 200, 0),   # cyan-ish
+            PHASE_FIRING:        (0, 0, 255),     # red
+            PHASE_VERIFY:        (255, 255, 255), # white
+            PHASE_HANDBACK:      (0, 255, 0),     # green
+            PHASE_DONE:          (0, 255, 0),
         }.get(phase, (200, 200, 200))
 
     # --- Main thread: video writer loop with full OSD overlay ---
@@ -2715,7 +2414,7 @@ def main():
                         cv2.circle(frame, (tcx, alt_target_y), 5, (255, 170, 0), -1)
 
                     # --- Mission banner (top center) ---
-                    mp = o.get("mission_phase", PHASE_DRONE_POSITIONING)
+                    mp = o.get("mission_phase", PHASE_CENTER_GIMBAL)
                     elapsed_s = time.monotonic() - run_start_mono
                     banner = (f"MISSION: {mp} | TARGET: {args.team_name}/"
                               f"#{args.target_number} | t={elapsed_s:.1f}s")
@@ -2748,10 +2447,8 @@ def main():
                     cv2.putText(
                         frame,
                         f"lock={o['lock_status']} "
-                        f"hold={o['hold_confirm_count']}/{args.lock_confirm_frames} "
-                        f"alt={o['altitude_confirm_count']}/{args.altitude_lock_confirm_frames} "
                         f"final={o['final_hold_status']} "
-                        f"final_streak={o['final_hold_streak']}/{args.handoff_confirm_frames}",
+                        f"[drone-frozen in gimbal_back_up]",
                         (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.50, lock_color,
                         2, cv2.LINE_AA)
 
