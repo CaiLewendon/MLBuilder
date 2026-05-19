@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-17 04:16:45 PDT
+Generated: 2026-05-18 18:31:33 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,11 +21,11 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                12f350b33523a3f07658dd3f39e715ccc79c0dd7 context: FullDataSetProdV2 trained; int8 export + EdgeTPU compile pending
+* cPCcputestinglocally                cad7a178a99e27b58ced6847d382c0aa2eabe0bc new model is great
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally 12f350b33523a3f07658dd3f39e715ccc79c0dd7 context: FullDataSetProdV2 trained; int8 export + EdgeTPU compile pending
-  remotes/origin/cTPUtest             ca44522ed0315ee01d54e6cc6793719085641be1 drone auto code scped
+  remotes/origin/cPCcputestinglocally cad7a178a99e27b58ced6847d382c0aa2eabe0bc new model is great
+  remotes/origin/cTPUtest             5357e428402c4555fee26bc48b0a3cc7839183c9 added image filters sharpen 0.4 goated?
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
 ```
@@ -34,10 +34,7 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 
 ```text
 ## cPCcputestinglocally...origin/cPCcputestinglocally
- M CLAUDE.md
  M CODEX/AILEARN_REPORT.md
- M CONTEXT.md
- M KANBAN.md
 
 ```
 
@@ -72,11 +69,16 @@ CODEX.md
 CONTEXT.md
 downloadedUpdatedProductiondata
 downloadedUpdatedProductiondata/calib_all.txt
+downloadedUpdatedProductiondata/calib_all.txt.v2bak
+downloadedUpdatedProductiondata/calib_deployment_heavy_500.txt
 downloadedUpdatedProductiondata/calib_subset_500.txt
 downloadedUpdatedProductiondata/classes.txt
+downloadedUpdatedProductiondata/data_calib_deployment_heavy.yaml
 downloadedUpdatedProductiondata/data_calib_subset.yaml
 downloadedUpdatedProductiondata/data_calib.yaml
 downloadedUpdatedProductiondata/data.yaml
+downloadedUpdatedProductiondata/data.yaml.v2bak
+downloadedUpdatedProductiondata/holdout.txt
 downloadedUpdatedProductiondata/images
 downloadedUpdatedProductiondata/images/0000fafa-00070.jpg
 downloadedUpdatedProductiondata/images/002481c9-frame_000207.jpg
@@ -7535,8 +7537,11 @@ downloadedUpdatedProductiondata/labels/ffc8463b-00040.txt
 downloadedUpdatedProductiondata/labels/ffdbef27-frame_000149.txt
 downloadedUpdatedProductiondata/labels/fffba55c-00077.txt
 downloadedUpdatedProductiondata/notes.json
+downloadedUpdatedProductiondata/robust_split_summary.json
 downloadedUpdatedProductiondata/train.txt
+downloadedUpdatedProductiondata/train.txt.v2bak
 downloadedUpdatedProductiondata/val.txt
+downloadedUpdatedProductiondata/val.txt.v2bak
 downloadedUpdatedProductiondata.zip
 export
 export/FullDataSetProd_full_integer_quant_edgetpu.tflite
@@ -7595,6 +7600,34 @@ export/FullDataSetProdV2_saved_model/saved_model.pb
 export/FullDataSetProdV2_saved_model/variables
 export/FullDataSetProdV2_saved_model/variables/variables.data-00000-of-00001
 export/FullDataSetProdV2_saved_model/variables/variables.index
+export/FullDataSetProdV3_depheavy_edgetpu.tflite
+export/FullDataSetProdV3_edgetpu.tflite
+export/FullDataSetProdV3_last.pt
+export/FullDataSetProdV3.onnx
+export/FullDataSetProdV3.pt
+export/FullDataSetProdV3_saved_model
+export/FullDataSetProdV3_saved_model/assets
+export/FullDataSetProdV3_saved_model/fingerprint.pb
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_float16.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_float32.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_depheavy.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_depheavy_v3_edgetpu.log
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_depheavy_v3_edgetpu.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_depheavy_v3.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_v3_edgetpu.log
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_v3_edgetpu.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_dwfix_v3.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_tf215_depheavy.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant_tf215.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_full_integer_quant.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_int8.tflite
+export/FullDataSetProdV3_saved_model/FullDataSetProdV3_integer_quant.tflite
+export/FullDataSetProdV3_saved_model/metadata.yaml
+export/FullDataSetProdV3_saved_model/saved_model.pb
+export/FullDataSetProdV3_saved_model/variables
+export/FullDataSetProdV3_saved_model/variables/variables.data-00000-of-00001
+export/FullDataSetProdV3_saved_model/variables/variables.index
 export/model_full_integer_quant_edgetpu.log
 export/model_full_integer_quant_edgetpu.tflite
 export/model_int8.tflite
@@ -15681,6 +15714,7 @@ requirements.txt
 target_detector_int8_edgetpu.tflite
 target_detector_labels.txt
 test
+test/inspect_clusters.py
 test/labels_coco80.txt
 test/manual_gimbal_control.py
 test/pi_mavlink_fullsuite_test.py
@@ -15688,6 +15722,7 @@ test/prepare_dataset_split.py
 test/__pycache__
 test/__pycache__/manual_gimbal_control.cpython-312.pyc
 test/__pycache__/pi_mavlink_fullsuite_test.cpython-312.pyc
+test/__pycache__/prepare_dataset_split.cpython-312.pyc
 test/__pycache__/rebuild_tpu_model_pi.cpython-312.pyc
 test/__pycache__/tf_inference_data_live.cpython-312.pyc
 test/__pycache__/tflite_raw_output_probe.cpython-312.pyc
@@ -15700,6 +15735,7 @@ test/__pycache__/tf_live_infrence_drone_simulation.cpython-312.pyc
 test/__pycache__/tf_live_infrence_gimbal_live.cpython-312.pyc
 test/__pycache__/tf_live_infrence_mavlink.cpython-312.pyc
 test/rebuild_tpu_model_pi.py
+test/robust_split.py
 test/tf_inference_data_live.py
 test/tflite_raw_output_probe.py
 test/tf_live_inferenceV2_backup.py
@@ -129896,10 +129932,13 @@ f5b8e26 | 2026-05-14 |  | gimbal works autonomously
 ca5f444 | 2026-05-14 |  | I got hte gimbal autonomy finished
 45850d7 | 2026-05-14 |  | using ack commands for status of firing from firing updated with Do repeat relay mavlink command
 1be6094 | 2026-05-15 |  | do repeat relay command for gimbal fireing and ack command state confirmation
-ca44522 | 2026-05-15 |  (origin/cTPUtest) | drone auto code scped
+ca44522 | 2026-05-15 |  | drone auto code scped
 e719ba5 | 2026-05-15 |  | added auto drone script for approach
 0a08dda | 2026-05-15 |  | context update
+5357e42 | 2026-05-16 |  (origin/cTPUtest) | added image filters sharpen 0.4 goated?
 0a754e5 | 2026-05-16 |  | Input preprocessing flags across all V2 scripts; --sharpen 0.4 validated
 7e2903d | 2026-05-16 |  | Add tf_live_inferenceV2_final_auto.py: Task 2 combined autonomous engagement
-12f350b | 2026-05-17 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | context: FullDataSetProdV2 trained; int8 export + EdgeTPU compile pending
+12f350b | 2026-05-17 |  | context: FullDataSetProdV2 trained; int8 export + EdgeTPU compile pending
+6a74c0b | 2026-05-17 |  | its to early after no sleep all night
+cad7a17 | 2026-05-18 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | new model is great
 ```

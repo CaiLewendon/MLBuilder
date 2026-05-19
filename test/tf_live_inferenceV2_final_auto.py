@@ -1169,6 +1169,25 @@ def main():
     parser.add_argument("--drone-deadband", type=float, default=0.08,
                         help="Normalized deadband for drone yaw alignment (default 0.08).")
     parser.add_argument("--camera-hfov-deg", type=float, default=78.0)
+
+    # --- Anti-jitter: bbox EMA + yaw-aligned hysteresis + NO_TARGET dropout grace ---
+    # Same fix as drone_auto 2026-05-18 — see those notes. Applies to the drone
+    # state machine in PHASE_DRONE_POSITIONING / PHASE_HANDOFF_WAIT only.
+    parser.add_argument("--bbox-ema-alpha", type=float, default=0.5,
+                        help="EMA weight on bbox center per new frame. 1.0=raw "
+                             "(no smoothing), lower=more smoothing. Default 0.5.")
+    parser.add_argument("--bbox-ema-reset-frames", type=int, default=3,
+                        help="Consecutive NO_TARGET frames before EMA resets. "
+                             "Default 3.")
+    parser.add_argument("--yaw-hysteresis-ratio", type=float, default=2.0,
+                        help="Exit-deadband / entry-deadband ratio. Entry="
+                             "drone_deadband, Exit=drone_deadband*ratio. Default 2.0.")
+    parser.add_argument("--yaw-align-dropout-frames", type=int, default=3,
+                        help="Frames with |err_x|>exit-deadband before latch releases. "
+                             "Default 3.")
+    parser.add_argument("--no-target-dropout-frames", type=int, default=3,
+                        help="NO_TARGET frames before hold_confirm_count / EMA / latch "
+                             "reset. Default 3.")
     parser.add_argument("--drone-yaw-gain", type=float, default=35.0,
                         help="Drone yaw-rate gain in deg/s at full err_x (default 35).")
     parser.add_argument("--max-yaw-rate", type=float, default=25.0)
@@ -1317,6 +1336,16 @@ def main():
             parser.error(f"{n} must be in [0,1]")
     if args.drone_deadband < 0.0 or args.drone_deadband >= 1.0:
         parser.error("--drone-deadband must be >= 0.0 and < 1.0")
+    if not (0.0 < args.bbox_ema_alpha <= 1.0):
+        parser.error("--bbox-ema-alpha must be in (0.0, 1.0]")
+    if args.bbox_ema_reset_frames < 1:
+        parser.error("--bbox-ema-reset-frames must be >= 1")
+    if args.yaw_hysteresis_ratio < 1.0:
+        parser.error("--yaw-hysteresis-ratio must be >= 1.0")
+    if args.yaw_align_dropout_frames < 1:
+        parser.error("--yaw-align-dropout-frames must be >= 1")
+    if args.no_target_dropout_frames < 1:
+        parser.error("--no-target-dropout-frames must be >= 1")
     if args.gimbal_deadband < 0.0 or args.gimbal_deadband >= 1.0:
         parser.error("--gimbal-deadband must be >= 0.0 and < 1.0")
     if args.min_track_confidence < 0.0 or args.min_track_confidence > 1.0:
@@ -1913,6 +1942,12 @@ def main():
         final_hold_engaged = False
         sim_target_cy = None
         prev_state = None
+        # Anti-jitter state — only active in PHASE_DRONE_POSITIONING / HANDOFF_WAIT.
+        ema_cx = None
+        ema_cy = None
+        yaw_aligned_latched = False
+        out_of_align_streak = 0
+        no_target_streak = 0
         run_start = time.perf_counter()
         # Gimbal frame counter (for log signature)
         gimbal_frame_idx = 0
@@ -2070,6 +2105,8 @@ def main():
             # ----------------------------------------------------------------
             if phase in (PHASE_DRONE_POSITIONING, PHASE_HANDOFF_WAIT):
                 if selected is None:
+                    no_target_streak += 1
+                    dropout_grace = no_target_streak < max(1, args.no_target_dropout_frames)
                     if locked_on_target:
                         state = STATE_LOCKED
                         move_label = "LOCKED_NO_TARGET"
@@ -2084,14 +2121,35 @@ def main():
                             move_label = "LOCKED_DIST_CORRECT"
                     else:
                         state = STATE_NO_TARGET
-                        hold_confirm_count = 0
-                        altitude_confirm_count = 0
-                        final_hold_engaged = False
-                        sim_target_cy = None
+                        if not dropout_grace:
+                            hold_confirm_count = 0
+                            altitude_confirm_count = 0
+                            final_hold_engaged = False
+                            sim_target_cy = None
+                            ema_cx = None
+                            ema_cy = None
+                            if yaw_aligned_latched:
+                                print(f"[YAW HYST] released (NO_TARGET streak "
+                                      f"{no_target_streak} >= "
+                                      f"{args.no_target_dropout_frames})", flush=True)
+                            yaw_aligned_latched = False
+                            out_of_align_streak = 0
+                        # else: brief flicker — keep counters / EMA / latch.
                 else:
+                    no_target_streak = 0
                     (x1, y1), (x2, y2) = selected["bbox"]
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
+                    raw_cx = (x1 + x2) / 2.0
+                    raw_cy = (y1 + y2) / 2.0
+                    # EMA smoothing on bbox center to kill 1-frame wobble.
+                    if ema_cx is None or ema_cy is None:
+                        ema_cx = raw_cx
+                        ema_cy = raw_cy
+                    else:
+                        a = clamp(args.bbox_ema_alpha, 0.0, 1.0)
+                        ema_cx = a * raw_cx + (1.0 - a) * ema_cx
+                        ema_cy = a * raw_cy + (1.0 - a) * ema_cy
+                    cx = ema_cx
+                    cy = ema_cy
                     if (not locked_on_target) or (sim_target_cy is None):
                         sim_target_cy = float(cy)
 
@@ -2120,7 +2178,28 @@ def main():
 
                     displacement_label = direction_label(err_x, err_y, args.drone_deadband)
                     yaw_label = yaw_direction_label(err_x, args.drone_deadband)
-                    yaw_aligned = yaw_label == "ALIGNED"
+                    # Hysteresis latch — see drone_auto for full rationale.
+                    entry_db = args.drone_deadband
+                    exit_db = args.drone_deadband * max(1.0, args.yaw_hysteresis_ratio)
+                    _prev_latch = yaw_aligned_latched
+                    if yaw_aligned_latched:
+                        if abs(err_x) > exit_db:
+                            out_of_align_streak += 1
+                            if out_of_align_streak >= max(1, args.yaw_align_dropout_frames):
+                                yaw_aligned_latched = False
+                                out_of_align_streak = 0
+                        else:
+                            out_of_align_streak = 0
+                    else:
+                        if abs(err_x) <= entry_db:
+                            yaw_aligned_latched = True
+                            out_of_align_streak = 0
+                    if _prev_latch != yaw_aligned_latched:
+                        print(f"[YAW HYST] "
+                              f"{'LATCHED' if yaw_aligned_latched else 'RELEASED'} "
+                              f"err_x={err_x:+.3f} entry_db={entry_db:.3f} "
+                              f"exit_db={exit_db:.3f}", flush=True)
+                    yaw_aligned = yaw_aligned_latched
                     in_distance_window = low_bound <= lidar_cm <= high_bound
 
                     if locked_on_target:
