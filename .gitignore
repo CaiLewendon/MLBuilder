@@ -14,8 +14,18 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+# Track source helpers under build/; ignore artifacts (npy/tflite/log/out subdir).
+build/*
+!build/*.py
+!build/*.sh
+build/out/
 export/
+
+# Local-only assistant state
+.claude/
+
+# Contains embedded session cookie; do not commit
+download_images.py
 develop-eggs/
 dist/
 downloads/

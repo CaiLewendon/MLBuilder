@@ -1,6 +1,6 @@
 # AI Learn Report
 
-Generated: 2026-05-18 18:31:33 PDT
+Generated: 2026-05-21 17:36:29 PDT
 
 Repository: `/home/caile/Documents/aerospace2025-26/MLBuilder`
 
@@ -21,10 +21,10 @@ _Missing file: /home/caile/Documents/aerospace2025-26/MLBuilder/CODEX/CONTEXT.md
 ## Git Branches
 
 ```text
-* cPCcputestinglocally                cad7a178a99e27b58ced6847d382c0aa2eabe0bc new model is great
+* cPCcputestinglocally                28e1f1f7e9daec69546b4046bda178ee20e29511 updated with gimbal adjustments and offset calibration script
   main                                454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
   remotes/origin/HEAD                 -> origin/main
-  remotes/origin/cPCcputestinglocally cad7a178a99e27b58ced6847d382c0aa2eabe0bc new model is great
+  remotes/origin/cPCcputestinglocally 28e1f1f7e9daec69546b4046bda178ee20e29511 updated with gimbal adjustments and offset calibration script
   remotes/origin/cTPUtest             5357e428402c4555fee26bc48b0a3cc7839183c9 added image filters sharpen 0.4 goated?
   remotes/origin/main                 454d20f2bd6a656c56c8bbc8b149443f49359be0 naming fix
 
@@ -15714,12 +15714,14 @@ requirements.txt
 target_detector_int8_edgetpu.tflite
 target_detector_labels.txt
 test
+test/aim_offset.py
 test/inspect_clusters.py
 test/labels_coco80.txt
 test/manual_gimbal_control.py
 test/pi_mavlink_fullsuite_test.py
 test/prepare_dataset_split.py
 test/__pycache__
+test/__pycache__/aim_offset.cpython-312.pyc
 test/__pycache__/manual_gimbal_control.cpython-312.pyc
 test/__pycache__/pi_mavlink_fullsuite_test.cpython-312.pyc
 test/__pycache__/prepare_dataset_split.cpython-312.pyc
@@ -15730,6 +15732,8 @@ test/__pycache__/tf_live_inferenceV2.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_drone_auto.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_final_auto.cpython-312.pyc
 test/__pycache__/tf_live_inferenceV2_gimbal_auto.cpython-312.pyc
+test/__pycache__/tf_live_inferenceV2_gimbal_back_up.cpython-312.pyc
+test/__pycache__/tf_live_inferenceV2_gimbal_offset_calibrate.cpython-312.pyc
 test/__pycache__/tf_live_infrence.cpython-312.pyc
 test/__pycache__/tf_live_infrence_drone_simulation.cpython-312.pyc
 test/__pycache__/tf_live_infrence_gimbal_live.cpython-312.pyc
@@ -15742,6 +15746,8 @@ test/tf_live_inferenceV2_backup.py
 test/tf_live_inferenceV2_drone_auto.py
 test/tf_live_inferenceV2_final_auto.py
 test/tf_live_inferenceV2_gimbal_auto.py
+test/tf_live_inferenceV2_gimbal_back_up.py
+test/tf_live_inferenceV2_gimbal_offset_calibrate.py
 test/tf_live_inferenceV2.py
 test/tf_live_infrence_drone_simulation.py
 test/tf_live_infrence_gimbal_live.py
@@ -129940,5 +129946,7 @@ e719ba5 | 2026-05-15 |  | added auto drone script for approach
 7e2903d | 2026-05-16 |  | Add tf_live_inferenceV2_final_auto.py: Task 2 combined autonomous engagement
 12f350b | 2026-05-17 |  | context: FullDataSetProdV2 trained; int8 export + EdgeTPU compile pending
 6a74c0b | 2026-05-17 |  | its to early after no sleep all night
-cad7a17 | 2026-05-18 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | new model is great
+cad7a17 | 2026-05-18 |  | new model is great
+8151b23 | 2026-05-18 |  | updated live scripts
+28e1f1f | 2026-05-19 |  (HEAD -> cPCcputestinglocally, origin/cPCcputestinglocally) | updated with gimbal adjustments and offset calibration script
 ```

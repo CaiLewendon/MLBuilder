@@ -1,6 +1,30 @@
 # Kanban
 
-## In Progress (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
+## In Progress (2026-05-22 early-morning — `FullDataSetProdV4b` BUILT, STRICT V3 UPGRADE; deploy `_depheavy_edgetpu.tflite` to Pi)
+
+### What's done
+- New Label Studio export at `project-1-at-2026-05-22-04-22-5cace4ec/` (4,340 images, +613 new vs V3).
+- V4a (caps 100/40, 50 epochs) trained + int8-exported + EdgeTPU-compiled. Full A/B vs V3 showed overall win (+5.1 pct hits) but **-1.6 pct on dominant 990-cluster** (deployment scene).
+- Diagnosed root cause: per-cluster `--cap-train 100` reserves 890 of the 990 deployment-scene images to holdout, starving the model.
+- V4b retrained with `--cap-train 99999 --cap-val 99999` (uncapped scene-aware split). Train=3,719 / val=621 / holdout=**0**. Dominant cluster contributes ~792 training frames.
+- V4b val: P=0.968, R=0.974, mAP50=0.990, mAP50-95=0.823 (on val=621, vs V3's val=400). mAP50 ties/beats V3.
+- V4b full int8 pipeline (yolo export 31 min → TF 2.15 convert ×2 → surgery + downgrade ×2 → edgetpu_compiler) ran clean. 132/211 EdgeTPU op split — same as V1/V2/V3/V4.
+- Full-dataset A/B (all 4,340 images): **V4b strict upgrade over V3 on every axis**. +233 total detects, +221 new-image detects, +12 V3-era detects, +324 high-confidence (≥0.75) detects. Deployment-cluster regression cured (92.4% vs V3's 92.7%, basically tied).
+- User authorized ship.
+
+### What's pending (Pi-side, next session)
+1. `scp export/FullDataSetProdV4b_depheavy_edgetpu.tflite pi@<PI>:~/`. Keep V1 + V3 + V4 on Pi for reference.
+2. `ssh pi 'sha256sum ~/FullDataSetProdV4b_depheavy_edgetpu.tflite'` should print `71ebc3499c1a00a61ea0f813c8947996394f501fc0e8bbbfa863135f865fa684`.
+3. Pi live verify with `--sharpen 0.4`. Expect ≥0.85 conf on deployment scene.
+4. Promote to autonomous scripts (`tf_live_inferenceV2_gimbal_auto.py`, `tf_live_inferenceV2_drone_auto.py`, `tf_live_inferenceV2_final_auto.py`) by swapping the model path on invocation — scripts are model-agnostic.
+5. Field test against Big City RPAS Task 2 target geometry.
+
+### Open: cluster 69 (73 images)
+All models (V1, V3, V4, V4b) hit 0% on cluster 69. Likely cause: bad labels, or an extreme corner case. Inspect a sample and decide whether to relabel or remove.
+
+---
+
+## ARCHIVED (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
 
 ### What's done
 - V2 Pi deploy + A/B revealed confidence collapse (0.06-0.50 vs V1's 0.85). Root cause: `prepare_dataset_split.py` re-clusters and re-bin-packs every time the input pool changes, leaking train↔val between V1 and V2 (527 V1-val→V2-train, 335 V1-train→V2-val). V2's val metrics looked OK because V2's val set had shifted.

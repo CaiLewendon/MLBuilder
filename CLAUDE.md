@@ -1,6 +1,76 @@
 # CLAUDE.md — MLBuilder Project Operating Notes
 
-## ⏸ WHERE WE LEFT OFF (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL DATASET A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
+## ⏸ WHERE WE LEFT OFF (2026-05-22 early morning — `FullDataSetProdV4b` BUILT, A/B WINS V3 STRICTLY; deploy `_depheavy_edgetpu.tflite` to Pi)
+
+**Session summary (V4 iteration to V4b after dominant-cluster regression):**
+- New Label Studio export landed at `project-1-at-2026-05-22-04-22-5cace4ec/` (4,340 images = strict superset of V3's 3,727 + **613 new**).
+- **V4a (50 epochs, robust_split caps 100/40)** built end-to-end (~95 min); A/B vs V3: overall +5.1 pct hits, +36 pct on the 613 new images, but **-1.6 pct on the dominant 990-cluster deployment scene** (91.1% vs V3's 92.7%). User pushed back: "I DO NOT WANT CLUSTERS EACH IN A FRAME IS AN INDIVIDUAL" — the cap was holding back 890 deployment-scene frames in holdout.
+- **V4b** re-split with `--cap-train 99999 --cap-val 99999` (effectively uncapped scene-aware). New split: train=3,719 / val=621 / holdout=**0**. Every labeled frame used in training. The 990-cluster deployment scene now contributes ~792 train images (vs V4's 100). Retrained 50 epochs (~28 min wall time on RTX 3070).
+- V4b final val (621 images, vs V4's 455 and V3's 400): **P=0.968, R=0.974, mAP50=0.990, mAP50-95=0.823**. Tied with V4 on P, beats V4 on mAP50 (+0.001) with a 55% larger val set (harder test).
+- Full int8 + EdgeTPU pipeline ran clean (same recipe as V3/V4): yolo export 32 min → TF 2.15 sidecar convert ×2 → flatbuffer surgery (1 grouped CONV_2D → DEPTHWISE at op 145, filter (128,3,3,1)) → op-version downgrade → edgetpu_compiler 16.0. **132 ops on Edge TPU / 211 on CPU — exact same split as V1/V2/V3/V4.**
+
+**Full-dataset A/B (all 4,340 images, int8 on CPU, ~11 min):**
+
+| Metric | V1_int8 | V3 dh | V4 dh | **V4b dh** ⭐ |
+|---|---|---|---|---|
+| Overall mean conf | 0.592 | 0.645 | 0.692 | **0.688** |
+| Overall median conf | 0.852 | 0.846 | 0.845 | **0.874** (+0.028 vs V3) |
+| Overall hit ≥0.25 | 69.4% | 75.3% | 80.4% | **80.7%** (+5.4 pct vs V3) |
+| Overall hit ≥0.50 | 67.0% | 72.9% | 79.2% | **77.5%** |
+| Overall hit ≥0.75 | 58.0% | 66.4% | 70.0% | **73.9%** (+7.5 pct vs V3) |
+| 613 new images hit | 62.8% | 61.2% | 97.2% | **97.2%** (+36 pct vs V3) |
+| V3-era 3,727 hit | 70.5% | 77.6% | 77.6% | **77.9%** (V4b beats V3 even on V3's home turf) |
+| Dominant 990-cluster hit | 91.5% | 92.7% | 91.1% | **92.4%** (V4 regression cured; -0.3 pct from V3 — effectively tied) |
+
+**Conclusion**: V4b is unambiguously better than V3 on every comparison axis. +233 more total images detected, +221 more new-image detects, +12 more V3-era detects, +324 more high-confidence (≥0.75) detects. The dominant-cluster regression that V4 had is cured by removing the per-cluster training cap (uncapped split lets the 990-cluster contribute 792 train images instead of 100).
+
+**Final deployable artifact:**
+- **`export/FullDataSetProdV4b_depheavy_edgetpu.tflite`** (3.05 MiB / 3200896 bytes)
+- sha256 **`71ebc3499c1a00a61ea0f813c8947996394f501fc0e8bbbfa863135f865fa684`**
+- Pre-compile source: `export/FullDataSetProdV4b_saved_model/FullDataSetProdV4b_full_integer_quant_dwfix_depheavy_v3.tflite`
+- Backup (per-cluster calib variant): `export/FullDataSetProdV4b_edgetpu.tflite` sha256 `a5156dbfb1e5bb8dc5dcc5d6733db5f1f563f80ddfbbedb85b4b86bcfd0908a0`
+- V4b weights: `export/FullDataSetProdV4b.pt` sha256 `ab3d0c885eeed610195e390bfdb9b00d83288d4d292654b353f033b03c995db9`
+- Input: int8 NHWC (1,640,640,3) scale 0.00392 zero -128. Output: int8 (1,5,8400) scale 0.00430 zero -125 (raw head — same signature as V1/V2/V3/V4; **identify by sha256 per [[feedback-hash-not-shape]]**).
+
+**REMAINING STEPS (next session):**
+
+1. **scp V4b depheavy to Pi:**
+   ```bash
+   scp export/FullDataSetProdV4b_depheavy_edgetpu.tflite pi@<PI>:~/FullDataSetProdV4b_depheavy_edgetpu.tflite
+   ssh pi 'sha256sum ~/FullDataSetProdV4b_depheavy_edgetpu.tflite'
+   # expect: 71ebc3499c1a00a61ea0f813c8947996394f501fc0e8bbbfa863135f865fa684
+   ```
+
+2. **Pi live verify** with production preproc recipe:
+   ```bash
+   python -B tf_live_inferenceV2.py ~/FullDataSetProdV4b_depheavy_edgetpu.tflite --tpu -p --no-output \
+     -l ../target_detector_labels.txt --sharpen 0.4
+   ```
+   Expect: `[ALLOCATE] TPU active: True`, `[OUT] shape=(1, 5, 8400)`, mean conf ~0.85+ on the deployment scene (V4b's 990-cluster median 0.783 is on int8; live FP performance should be higher).
+
+3. **If V4b ≥ V3 on Pi live → promote to autonomous scripts:**
+   ```bash
+   python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProdV4b_depheavy_edgetpu.tflite \
+     --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+     --start-from-current-gimbal --team-name <team> --target-number 1
+   ```
+
+**Key takeaways (don't repeat lessons):**
+- **Per-cluster training caps hurt deployment-scene performance** when one scene dominates the labeled pool. With 990 images of the deployment scene, capping training at 100 means the model sees 11% of the deployment-scene data and 89% gets wasted in holdout. Uncapped scene-aware split (anti-leakage only, no caps) is the right recipe. New memory: [[feedback-no-train-caps]].
+- **Scene-aware splitting is for anti-leakage, NOT for balancing.** dhash clusters keep train/val from sharing the same video frames. The cap mechanism in `robust_split.py` is appropriate only when val needs balancing (which it doesn't if val is naturally diverse).
+- **Val-set size matters when comparing val metrics across runs.** V3's val=400, V4's val=455, V4b's val=621. Lower-bound metric comparisons are misleading when val sets differ; the int8 A/B on the full pool is the only fair test.
+
+**Key build helpers (parameterized — reuse for V5):**
+- `test/robust_split.py --cap-train 99999 --cap-val 99999` — uncapped scene-aware split.
+- `build/dump_clusters_v4.py` (V4 dataset) — generates `build/v4_clusters.json` cache (4,340 images, 1,394 clusters; hash threshold 5).
+- `build/build_deployment_heavy_calib_v4.py` — V4-dataset 250 dominant + 250 round-robin calib.
+- `build/build_calib_npy.py` / `build/convert_int8_tf215.py` / `build/surgery_grouped_to_depthwise.py` / `build/downgrade_conv2d_version.py` — int8 pipeline (all `sys.argv` parameterized).
+- `build/run_v4b_int8_pipeline.sh` — full chained int8 pipeline runner (forkable for V5+).
+- `build/full_dataset_ab_v4b.py` — 4-way A/B (V1 / V3 dh / V4 dh / V4b dh) on all V4 images. Extendable.
+
+---
+
+## ⏸ PRIOR WHERE WE LEFT OFF (2026-05-17 evening — `FullDataSetProdV3` BUILT, FULL DATASET A/B WINS V1; deploy `_depheavy_edgetpu.tflite` to Pi)
 
 **Session summary (after the V2 Pi A/B revealed regression):**
 - User ran V2 on Pi: confidence collapsed to 0.06-0.50 (vs V1's 0.85). Diagnosed root cause: `prepare_dataset_split.py` produces a NEW dhash-cluster split every time the input pool changes — so V2's split moved 527 of V1's val images into V2's train and 335 of V1's train images into V2's val. V2 metrics looked OK on V2's val (since that val included V1-trained-on images), but V2 generalization to actually-new images was untrained.

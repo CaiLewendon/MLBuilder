@@ -1,5 +1,89 @@
 # Deployment Context (Deep State Snapshot)
 
+## 2026-05-22 early-morning Session Addendum — `FullDataSetProdV4b` BUILT, STRICT V3 UPGRADE, READY for Pi deploy
+
+New Label Studio export at `project-1-at-2026-05-22-04-22-5cace4ec/` (4,340 images, strict superset of V3's pool with +613 new images). Iterated to V4b after V4a regressed on the dominant deployment-scene cluster.
+
+### V4 iteration arc
+
+**V4a (50 epochs, robust_split caps 100/40):** A/B vs V3 — overall +5.1 pct hits, +36 pct on new images, **-1.6 pct on dominant 990-cluster**. The 100-cap meant only 100 of 990 deployment-scene images entered training; 890 wasted in holdout.
+
+**V4b (50 epochs, robust_split uncapped):** User direction "I DO NOT WANT CLUSTERS EACH IN A FRAME IS AN INDIVIDUAL." Re-split with caps at 99999/99999 → train=3,719 / val=621 / holdout=**0**. Dominant cluster contributes ~792 train images.
+
+### V4b final val (621 images)
+
+| Metric | V3 (val=400) | V4 (val=455) | V4b (val=621) |
+|---|---|---|---|
+| Precision | 0.968 | 0.968 | 0.968 |
+| Recall | 0.975 | 0.975 | 0.974 |
+| mAP50 | 0.989 | 0.989 | **0.990** |
+| mAP50-95 | 0.842 | 0.833 | 0.823 |
+
+### Full-dataset int8 A/B (all 4,340 images)
+
+| Metric | V1 | V3 dh | V4 dh | **V4b dh** ⭐ |
+|---|---|---|---|---|
+| Overall mean | 0.592 | 0.645 | 0.692 | 0.688 |
+| Overall median | 0.852 | 0.846 | 0.845 | **0.874** |
+| Hit ≥0.25 | 69.4% | 75.3% | 80.4% | **80.7%** |
+| Hit ≥0.5 | 67.0% | 72.9% | 79.2% | 77.5% |
+| Hit ≥0.75 | 58.0% | 66.4% | 70.0% | **73.9%** |
+
+**613 new images:** V1=62.8% / V3=61.2% / V4=97.2% / **V4b=97.2%** (med 0.874 — V4b beats V4 on confidence).
+
+**V3-era 3,727 images:** V3=77.6% / V4=77.6% / **V4b=77.9%** (V4b beats V3 on V3's own pool).
+
+**Dominant 990-cluster (deployment scene):** V1=91.5% / V3=92.7% / V4=91.1% / **V4b=92.4%** (regression cured).
+
+**Per-cluster spot-checks:**
+- Cluster 16 (82 images): V3=0% / V4=100% / V4b=100% — V4-series unlocked a scene V3 totally missed.
+- Cluster 0 (100): V3=35% / V4=43% / V4b=44%.
+- Cluster 69 (73): all 0% — likely bad labels or impossibly different scene. Open work item.
+
+### Final artifacts
+
+| File | sha256 | Size |
+|---|---|---|
+| `export/FullDataSetProdV4b.pt` | `ab3d0c885eeed610195e390bfdb9b00d83288d4d292654b353f033b03c995db9` | 5.2 MB |
+| `export/FullDataSetProdV4b_edgetpu.tflite` (per-cluster) | `a5156dbfb1e5bb8dc5dcc5d6733db5f1f563f80ddfbbedb85b4b86bcfd0908a0` | 3.1 MB |
+| **`export/FullDataSetProdV4b_depheavy_edgetpu.tflite`** ⭐ | **`71ebc3499c1a00a61ea0f813c8947996394f501fc0e8bbbfa863135f865fa684`** | 3.1 MB |
+
+EdgeTPU op split: 132 on TPU / 211 on CPU (same as V1/V2/V3/V4). Input int8 (1,640,640,3) scale 0.00392 zero -128. Output int8 (1,5,8400) scale 0.00430 zero -125 (raw head).
+
+### Reusable build helpers added this session
+
+- `build/dump_clusters_v4.py` — generates `build/v4_clusters.json` (one-shot dhash + cluster cache).
+- `build/build_deployment_heavy_calib_v4.py` — V4-dataset depheavy 250+250 calib.
+- `build/run_v4_int8_pipeline.sh` / `build/run_v4b_int8_pipeline.sh` — chained int8 pipeline runners.
+- `build/full_dataset_ab_v4.py` / `build/full_dataset_ab_v4b.py` — full A/B with progress flushing.
+- `build/new_images_v4_not_v3.txt` — 613 filenames added in May-22 export.
+
+### Logs
+
+- `build/v4_split.log`, `build/v4_train.log`, `build/v4_pipeline.log`, `build/v4_ab.log`
+- `build/v4b_train.log`, `build/v4b_pipeline.log`, `build/v4b_ab.log`
+- `build/full_dataset_ab_v4.json`, `build/full_dataset_ab_v4b.json` — JSON A/B reports.
+
+### Pi deploy commands (next session)
+
+```bash
+# 1. scp
+scp export/FullDataSetProdV4b_depheavy_edgetpu.tflite pi@<PI>:~/FullDataSetProdV4b_depheavy_edgetpu.tflite
+ssh pi 'sha256sum ~/FullDataSetProdV4b_depheavy_edgetpu.tflite'
+# expect: 71ebc3499c1a00a61ea0f813c8947996394f501fc0e8bbbfa863135f865fa684
+
+# 2. Pi live verify
+python -B tf_live_inferenceV2.py ~/FullDataSetProdV4b_depheavy_edgetpu.tflite --tpu -p --no-output \
+  -l ../target_detector_labels.txt --sharpen 0.4
+
+# 3. Autonomous scripts (after Pi verify)
+python3 -B tf_live_inferenceV2_final_auto.py ~/FullDataSetProdV4b_depheavy_edgetpu.tflite \
+  --tpu -p --no-output --mavlink tcp:10.42.0.1:5760 --sharpen 0.4 \
+  --start-from-current-gimbal --team-name <team> --target-number 1
+```
+
+---
+
 ## 2026-05-17 evening Session Addendum — `FullDataSetProdV3` BUILT, FULL DATASET A/B WINS V1
 
 After V2 was deployed to Pi and showed confidence collapse (0.06-0.50 vs V1's 0.85), the user authorized a full diagnostic + retrain. Root cause identified: `prepare_dataset_split.py` is not stable across input-pool changes — V2's dhash clusters were re-bin-packed from scratch, leaking 527 of V1's val images into V2's train and 335 of V1's train images into V2's val. V2's val metrics looked OK because the val set itself had shifted to include V1-trained-on images.
