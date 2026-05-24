@@ -72,7 +72,8 @@ COCO80_NAMES = [
 ]
 
 pipeline3 = (
-    "rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! "
+    # gun_high = gimbal/gun-boresight camera (this script aims + fires off it).
+    "rtspsrc location=rtsp://10.42.0.1:8554/gun_high latency=200 ! "
     "rtpjitterbuffer latency=200 ! "
     "rtph264depay ! "
     "h264parse ! "

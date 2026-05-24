@@ -1,0 +1,22 @@
+[Unit]
+Description=MAVLink-triggered manual photo service (Task 2 gun_high/front_high captures)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+# Helpers (wetness_check.py, target_photo.py, target_tracker.py) must sit next
+# to mavlink_photo_service.py in /home/pi (flat scp layout).
+# Uses the pyenv interpreter that has cv2 + pymavlink + numpy (the one the
+# engagement scripts run under). System /usr/bin/python3 does NOT have cv2.
+# If the pyenv version changes, update this absolute path.
+ExecStart=/home/pi/.pyenv/versions/3.9.19/bin/python3 -B /home/pi/mavlink_photo_service.py --config /images/photo_service_config.json
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

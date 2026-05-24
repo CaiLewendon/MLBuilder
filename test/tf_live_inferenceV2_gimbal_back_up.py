@@ -90,6 +90,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aim_offset import add_aim_offset_args, resolve_aim_offset_from_args  # noqa: E402
+import wetness_check  # noqa: E402
+import target_photo  # noqa: E402
+from target_tracker import TargetTracker  # noqa: E402
 
 FPS = 10
 WIDTH = 1920
@@ -163,15 +166,18 @@ COCO80_NAMES = [
     "vase", "scissors", "teddy bear", "hair drier", "toothbrush",
 ]
 
-pipeline3 = (
-    "rtspsrc location=rtsp://10.42.0.1:8554/front_high latency=200 ! "
-    "rtpjitterbuffer latency=200 ! "
-    "rtph264depay ! "
-    "h264parse ! "
-    "avdec_h264 ! "
-    "videoconvert ! "
-    "appsink drop=true max-buffers=1 sync=false"
-)
+def build_rtsp_pipeline(rtsp_url, latency=200):
+    """GStreamer appsink pipeline for an RTSP H.264 source (drop-old single slot).
+    gimbal_back_up is single-camera and uses the gun_high (gimbal) feed only."""
+    return (
+        f"rtspsrc location={rtsp_url} latency={int(latency)} ! "
+        "rtpjitterbuffer latency=200 ! "
+        "rtph264depay ! "
+        "h264parse ! "
+        "avdec_h264 ! "
+        "videoconvert ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
 
 pipeline4 = (
     "appsrc is-live=true do-timestamp=true block=false max-bytes=20000000 format=time ! "
@@ -988,14 +994,34 @@ def open_mavlink_and_check_guided(
     print(f"[MAVLINK] Connecting: {connection_str}", flush=True)
     try:
         master = mavutil.mavlink_connection(connection_str)
-        master.wait_heartbeat(timeout=heartbeat_timeout)
+        # mavp2p delivers heartbeats from many systems (FC, QGC, gimbal, and the
+        # router itself as sysid 0). Lock onto the REAL autopilot (component 1
+        # with a valid autopilot type) so target_system is the FC — otherwise
+        # commands target the wrong system and the vehicle never responds.
+        deadline = time.time() + heartbeat_timeout
+        hb = None
+        while time.time() < deadline:
+            m = master.recv_match(type="HEARTBEAT", blocking=True, timeout=1.0)
+            if m is None:
+                continue
+            if (m.get_srcComponent() == mavutil.mavlink.MAV_COMP_ID_AUTOPILOT1
+                    and m.autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID):
+                master.target_system = m.get_srcSystem()
+                master.target_component = m.get_srcComponent()
+                hb = m
+                break
+        if hb is None:
+            print(f"[MAVLINK] WARNING: no autopilot heartbeat (component 1) in "
+                  f"{heartbeat_timeout:.0f}s — is the FC powered and routed?",
+                  flush=True)
+            return None, None
         print(f"[MAVLINK] heartbeat sysid={master.target_system} "
               f"compid={master.target_component}", flush=True)
     except Exception as e:
         print(f"[MAVLINK] WARNING: connection/heartbeat failed: {e}", flush=True)
         return None, None
 
-    mode = getattr(master, "flightmode", None)
+    mode = mavutil.mode_string_v10(hb)
     print(f"[MAVLINK] autopilot flightmode={mode}", flush=True)
 
     if require_guided and mode != "GUIDED":
@@ -1117,6 +1143,14 @@ def main():
     parser.add_argument("--video", type=str, default=None,
                         help="Override RTSP source with a local video index or path "
                              "(used by --no-mavlink laptop dry-runs).")
+
+    # --- Camera (single gun_high feed) ---
+    parser.add_argument("--rtsp-base", type=str, default="rtsp://10.42.0.1:8554",
+                        help="RTSP server base; camera URL is <base>/<gun-stream>.")
+    parser.add_argument("--gun-stream", type=str, default="gun_high",
+                        help="Gimbal/gun-boresight camera stream path. Default gun_high.")
+    parser.add_argument("--gun-rtsp", type=str, default=None,
+                        help="Full gun-camera RTSP URL (overrides --rtsp-base/--gun-stream).")
 
     # --- Detection post-filtering ---
     parser.add_argument("--min-conf", type=float, default=0.05,
@@ -1293,11 +1327,17 @@ def main():
                         help="Team name in Task 2 photo filename "
                              "Task_2_<team_name>_target_<#>_<ts>.jpg. "
                              "Set on every live run!")
-    parser.add_argument("--target-number", type=int, default=1,
-                        help="Target index in Task 2 photo filename. Increment "
-                             "between successive engagements within a flight window.")
-    parser.add_argument("--photo-output-dir", type=str, default="./extinguish_photos",
-                        help="Directory for saved JPEGs. Created if absent.")
+    parser.add_argument("--target-number", type=int, default=None,
+                        help="Override the Task 2 target index. When omitted, the "
+                             "shared counter (/images/target_state.json) is used so "
+                             "autonomous + manual captures stay in extinguishing order.")
+    parser.add_argument("--photo-output-dir", type=str, default="/images",
+                        help="Root for saved JPEGs; the gun_high screenshot lands in "
+                             "<dir>/gun_high/. Created if absent. Default /images "
+                             "(the Google-Drive-synced folder on the Pi).")
+    parser.add_argument("--state-file", type=str, default="/images/target_state.json",
+                        help="Shared target-counter JSON (also used by the manual "
+                             "photo service) so numbering is centralized.")
     parser.add_argument("--no-photo-capture", action="store_true",
                         help="Skip PHASE_VERIFY entirely (NOT Task-2-compliant; "
                              "use only for testing without team-name set).")
@@ -1427,7 +1467,8 @@ def main():
     else:
         print("[PREPROC] (none — defaults)", flush=True)
 
-    # --- Camera ---
+    # --- Camera (single gun_high feed) ---
+    gun_url = args.gun_rtsp or f"{args.rtsp_base}/{args.gun_stream}"
     if args.video is not None:
         # Local source (laptop dry-run convenience)
         try:
@@ -1436,7 +1477,8 @@ def main():
             video_src = args.video
         cap = cv2.VideoCapture(video_src)
     else:
-        cap = cv2.VideoCapture(pipeline3, cv2.CAP_GSTREAMER)
+        cap = cv2.VideoCapture(build_rtsp_pipeline(gun_url), cv2.CAP_GSTREAMER)
+        print(f"[CAMERA] gun={gun_url}", flush=True)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         print("Error: Could not open video stream.", flush=True)
@@ -1546,11 +1588,25 @@ def main():
         dry_run=(args.no_mavlink or master is None),
     )
 
+    # --- Shared target counter (centralized with the manual photo service). ---
+    target_tracker = TargetTracker(
+        state_path=args.state_file,
+        team_name=(None if args.team_name == "unknown" else args.team_name),
+        start_target=args.target_number,
+    )
+
+    def current_target_number():
+        return target_tracker.current_target()
+
+    team_name = target_tracker.get_team()
+
     # --- Startup banner ---
     print("=" * 78, flush=True)
     print("[MISSION] Big City RPAS Task 2 — combined autonomous engagement", flush=True)
-    print(f"[MISSION] team={args.team_name!r}  target_number={args.target_number}  "
+    print(f"[MISSION] team={team_name!r}  target_number={current_target_number()}  "
           f"handback_mode={args.handback_mode}", flush=True)
+    print(f"[MISSION] state_file={args.state_file}  photo_root={args.photo_output_dir}",
+          flush=True)
     print(f"[MISSION] drone tx={'LIVE-FLY' if args.live_fly else 'BLANK'}  "
           f"discharge={'LIVE' if args.live_fire else ('DISABLED' if args.no_fire else 'BLANK')}",
           flush=True)
@@ -1561,7 +1617,7 @@ def main():
     print(f"[MISSION] center_duration={args.center_duration:.1f}s  "
           f"fire_period={args.fire_period:.1f}s  "
           f"handback={args.handback_mode}  "
-          f"team={args.team_name} target=#{args.target_number}", flush=True)
+          f"team={team_name} target=#{current_target_number()}", flush=True)
     print("[INFO] Axis assumptions:", flush=True)
     print("  image: +x=right, +y=down, center=(frame_w/2, frame_h/2)", flush=True)
     print("  drone yaw: target right -> +yaw_rate (clockwise)", flush=True)
@@ -1633,11 +1689,15 @@ def main():
         "verify_started_at": None,
         "verify_frames_captured": 0,
         "verify_best_frame": None,    # (np.ndarray, score, mono_time, kind)
+        "verify_samples": [],         # [(frame, bbox), ...] for wetness aggregation
         "verify_photo_path": None,
         "verify_done": False,
         "handback_started_at": None,
         "handback_mode_ack": None,    # (result, mono_time)
         "handback_done": False,
+        # Pre-fire purple baseline (gun_high) for the wetness shift check.
+        "purple_baseline_hue": None,
+        "purple_baseline_samples": [],
     }
     run_start_mono = time.monotonic()
 
@@ -1749,12 +1809,13 @@ def main():
             # This branch is a no-op terminal sink.
             pass
 
-    # --- Photo capture (PHASE_VERIFY) ---
+    # --- Photo capture + wetness verification (PHASE_VERIFY) ---
     def do_verify_capture(frame, selected, frame_w, frame_h) -> None:
-        """Called every inference frame while mission_phase == PHASE_VERIFY.
-        Captures --capture-frame-count frames at --capture-frame-interval spacing,
-        keeps the best by confidence (Laplacian variance fallback), and saves
-        the final JPEG when complete."""
+        """Captures --capture-frame-count frames at --capture-frame-interval
+        spacing (gun_high feed), keeps the best by confidence (Laplacian
+        fallback), saves the JPEG to /images/gun_high/ and advances the shared
+        target counter ONLY if the purple->blue wetness check is confidently
+        WETTED. The photo is ALWAYS saved regardless of the check."""
         now = time.monotonic()
         n = mission_state["verify_frames_captured"]
         started = mission_state["verify_started_at"]
@@ -1764,6 +1825,7 @@ def main():
         if now < next_capture_at:
             return
 
+        bbox = selected["bbox"] if selected is not None else None
         conf = float(selected["confidence"]) if selected is not None else None
         if conf is None:
             try:
@@ -1780,6 +1842,7 @@ def main():
         prev = mission_state["verify_best_frame"]
         if prev is None or score > prev[1]:
             mission_state["verify_best_frame"] = (frame.copy(), score, now, kind)
+        mission_state["verify_samples"].append((frame.copy(), bbox))
 
         mission_state["verify_frames_captured"] = n + 1
         best_score = mission_state["verify_best_frame"][1]
@@ -1787,27 +1850,35 @@ def main():
               f"({kind}={score:.3f}); best so far {best_score:.3f}", flush=True)
 
         if mission_state["verify_frames_captured"] >= args.capture_frame_count:
+            best = mission_state["verify_best_frame"][0]
+            target_num = current_target_number()
             try:
-                out_dir = pathlib.Path(args.photo_output_dir).expanduser()
-                out_dir.mkdir(parents=True, exist_ok=True)
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                fname = (f"Task_2_{args.team_name}_target_{args.target_number}_"
-                         f"{ts}.jpg")
-                path = out_dir / fname
-                best = mission_state["verify_best_frame"][0]
-                ok = cv2.imwrite(str(path), best,
-                                 [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                if ok:
-                    mission_state["verify_photo_path"] = str(path)
-                    print(f"[VERIFY DECLARED] Photo saved at {path}", flush=True)
-                    print("[VERIFY] Upload to team Google Drive folder.", flush=True)
-                    print("[VERIFY] Visually confirm target turned BLUE before "
-                          "declaring to judges (false declaration penalty = "
-                          "-P_indoor or -P_outdoor pts).", flush=True)
-                else:
-                    print(f"[VERIFY ERROR] cv2.imwrite failed for {path}", flush=True)
+                path = target_photo.save_target_photo(
+                    best, camera="gun_high", team=target_tracker.get_team(),
+                    target_num=target_num, out_root=args.photo_output_dir)
+                mission_state["verify_photo_path"] = str(path)
+                print(f"[VERIFY DECLARED] Photo saved at {path}", flush=True)
+                print("[VERIFY] Upload to team Google Drive folder.", flush=True)
             except Exception as e:
-                print(f"[VERIFY ERROR] capture/save failed: {e}", flush=True)
+                print(f"[VERIFY ERROR] photo save failed: {e}", flush=True)
+
+            baseline = mission_state.get("purple_baseline_hue")
+            results = [
+                wetness_check.assess_shift(f, bb, baseline)
+                for (f, bb) in mission_state["verify_samples"]
+            ]
+            state, blue_r, purple_r, npx = wetness_check.aggregate(results)
+            mode = "shift" if baseline is not None else "absolute-fallback"
+            print(f"[WETNESS] result={state} blue={blue_r:.2f} purple={purple_r:.2f} "
+                  f"n_px={npx} baseline_hue={baseline} ({mode})", flush=True)
+            if state == "WETTED":
+                used = target_tracker.advance_target("gimbal_back_up verify wetted")
+                print(f"[WETNESS] target #{used} CONFIRMED extinguished; "
+                      f"counter -> {target_tracker.current_target()}", flush=True)
+            else:
+                print(f"[WETNESS] target #{target_num} NOT confirmed wetted "
+                      f"({state}); photo saved, target# NOT advanced — re-engage or "
+                      f"declare manually after visual check.", flush=True)
             mission_state["verify_done"] = True
 
     # --- Handback (PHASE_HANDBACK) ---
@@ -2058,6 +2129,16 @@ def main():
                     tcy = int(round((y1 + y2) / 2.0))
                     err_x = (tcx - fx) / max(1.0, fx)
                     err_y = (tcy - fy) / max(1.0, fy)
+                    # Pre-fire purple baseline for the wetness shift check —
+                    # sampled before any water is applied. Running median.
+                    bh = wetness_check.baseline_hue(frame, selected["bbox"])
+                    if bh is not None:
+                        samples = mission_state["purple_baseline_samples"]
+                        samples.append(bh)
+                        if len(samples) > 15:
+                            del samples[0]
+                        mission_state["purple_baseline_hue"] = float(
+                            sorted(samples)[len(samples) // 2])
 
                 # Timer-based transition to PHASE_FIRING
                 with mission_lock:
@@ -2133,6 +2214,7 @@ def main():
                             mission_state["verify_started_at"] = time.monotonic()
                             mission_state["verify_frames_captured"] = 0
                             mission_state["verify_best_frame"] = None
+                            mission_state["verify_samples"] = []
                             mission_state["verify_done"] = False
                         _transition_phase(
                             PHASE_VERIFY,
@@ -2310,7 +2392,7 @@ def main():
                 f"dist_err={dist_error_cm:+.1f}cm "
                 f"CMD vx={vx:+.3f} vz={vz:+.3f} yaw={yaw_rate:+.2f}deg/s "
                 f"mode={mode_tag} tx={drone_tx_tag}/{fire_tx_tag} "
-                f"target={args.team_name}/{args.target_number}",
+                f"target={team_name}/{target_tracker.cached_current()}",
                 flush=True,
             )
 
@@ -2416,8 +2498,8 @@ def main():
                     # --- Mission banner (top center) ---
                     mp = o.get("mission_phase", PHASE_CENTER_GIMBAL)
                     elapsed_s = time.monotonic() - run_start_mono
-                    banner = (f"MISSION: {mp} | TARGET: {args.team_name}/"
-                              f"#{args.target_number} | t={elapsed_s:.1f}s")
+                    banner = (f"MISSION: {mp} | TARGET: {team_name}/"
+                              f"#{target_tracker.cached_current()} | t={elapsed_s:.1f}s")
                     cv2.putText(frame, banner, (10, 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                                 _phase_color(mp), 2, cv2.LINE_AA)
@@ -2591,8 +2673,8 @@ def main():
         with mission_lock:
             photo = mission_state["verify_photo_path"]
         print("=" * 78, flush=True)
-        print(f"[MISSION DONE] team={args.team_name} target={args.target_number}",
-              flush=True)
+        print(f"[MISSION DONE] team={team_name} "
+              f"next_target={target_tracker.cached_current()}", flush=True)
         if photo:
             print(f"[MISSION DONE] photo={photo}", flush=True)
             print("[MISSION DONE] Upload to team Google Drive folder and visually "

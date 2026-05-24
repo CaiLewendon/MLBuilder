@@ -1,0 +1,43 @@
+{
+  "team_name": "UBCO_AEROSPACE",
+  "mavlink": "tcp:10.42.0.1:5760",
+
+  "source_system": 1,
+  "source_component": 191,
+  "announce_heartbeat": true,
+  "heartbeat_hz": 1.0,
+
+  "photo_cmd": 218,
+  "actions": {
+    "304": { "camera": "gun_high",   "wetness_check": true,  "advance_on_wetted": true },
+    "305": { "camera": "front_high", "wetness_check": false, "advance_on_wetted": false }
+  },
+
+  "rtsp_base": "rtsp://10.42.0.1:8554",
+  "streams": { "gun_high": "gun_high", "front_high": "front_high" },
+
+  "out_root": "/images",
+  "state_file": "/images/target_state.json",
+
+  "detect_model": false,
+  "model_path": "~/FullDataSetProdV4b_depheavy_edgetpu.tflite",
+
+  "heartbeat_timeout": 30.0,
+  "diagnostic_seconds": 20.0,
+  "debounce_seconds": 2.0,
+  "burst_count": 5,
+  "burst_warmup_frames": 8,
+  "burst_interval": 0.1,
+
+  "wetness": {
+    "purple_h": [125, 160],
+    "blue_h": [90, 125],
+    "sat_min": 25,
+    "val_min": 30,
+    "val_max": 245,
+    "wetted_threshold": 0.5,
+    "shift_margin": 12,
+    "min_colored_px": 60,
+    "center_crop_frac": 0.4
+  }
+}

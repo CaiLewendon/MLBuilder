@@ -1,0 +1,15 @@
+[Unit]
+Description=Reset Task 2 target counter to 1 at boot (per power cycle)
+# Run before the photo service so the counter is fresh before any capture.
+Before=mavlink_photo_service.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Uses the pyenv interpreter (has the deps); resets /images/target_state.json
+# next_target -> 1, keeping team_name from the config.
+ExecStart=/home/pi/.pyenv/versions/3.9.19/bin/python3 -B /home/pi/mavlink_photo_service.py --reset-counter --config /images/photo_service_config.json
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
